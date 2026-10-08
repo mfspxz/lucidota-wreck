@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use wreck_graph::{ChangeView, FileChange};
 use wreck_protocol::{ChangeClaim, ScopeItem, Sha};
@@ -257,19 +258,14 @@ impl ArtifactsClient {
         Ok(())
     }
 
-    fn get_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
+    fn get_bytes_capped(&self, url: &str, cap: u64) -> Result<Vec<u8>, String> {
         let resp = self
             .agent
             .get(url)
             .set("Authorization", &format!("Bearer {}", self.api_token))
             .call()
             .map_err(|e| format!("artifacts GET {}: {}", url, e))?;
-        let mut buf = vec![];
-        use std::io::Read;
-        resp.into_reader()
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("artifacts read: {}", e))?;
-        Ok(buf)
+        read_capped(resp.into_reader(), cap, &format!("blob {url}"))
     }
 
     pub fn ensure_namespace(&self, jurisdiction: Option<&str>) -> Result<(), String> {
@@ -372,7 +368,51 @@ impl ArtifactsClient {
             repo,
             hash
         );
-        self.get_bytes(&url)
+        self.get_bytes_capped(&url, MAX_BLOB_BYTES)
+    }
+}
+
+/// L3 (cycle-06 audit): the old get_bytes read unboundedly — the "32MB cap"
+/// was an assumption, never an enforcement. Blobs are now read through a
+/// hard per-blob cap, and diff_view enforces a total byte budget across
+/// files. Both fail closed: reject-never-truncate, never silent partial.
+pub const MAX_BLOB_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_TOTAL_DIFF_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read at most `cap` bytes; fail closed past the cap (reject, never
+/// truncate). Pure over Read: unit-testable without network.
+fn read_capped<R: std::io::Read>(r: R, cap: u64, what: &str) -> Result<Vec<u8>, String> {
+    let mut limited = r.take(cap + 1);
+    let mut buf = vec![];
+    limited
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("artifacts read {what}: {e}"))?;
+    if buf.len() as u64 > cap {
+        return Err(format!(
+            "artifacts: {what} exceeds {cap} byte cap — refusing unbounded read"
+        ));
+    }
+    Ok(buf)
+}
+
+/// Running byte budget for one diff_view: fail-closed when exhausted.
+struct ByteBudget {
+    remaining: u64,
+}
+
+impl ByteBudget {
+    fn new(cap: u64) -> Self {
+        Self { remaining: cap }
+    }
+
+    fn take(&mut self, n: u64, what: &str) -> Result<(), String> {
+        if n > self.remaining {
+            return Err(format!(
+                "artifacts: diff of {what} would exceed the {MAX_TOTAL_DIFF_BYTES} byte total budget — refusing"
+            ));
+        }
+        self.remaining -= n;
+        Ok(())
     }
 }
 
@@ -540,6 +580,9 @@ impl ArtifactsClient {
         let mut paths: Vec<String> = old_tree.keys().chain(new_tree.keys()).cloned().collect();
         paths.sort();
         paths.dedup();
+        // L3: a hostile fork could touch thousands of 32MB blobs; the total
+        // diff budget fails closed before memory pressure becomes a DoS.
+        let mut budget = ByteBudget::new(MAX_TOTAL_DIFF_BYTES);
         let mut measured: HashMap<String, FileChange> = HashMap::new();
         for path in paths {
             let oh = old_tree.get(&path);
@@ -555,7 +598,9 @@ impl ArtifactsClient {
                 Some(h) => self.blob_bytes(repo, h)?,
                 None => vec![],
             };
-            // skip likely-binary blobs (32MB cap means this is bounded anyway)
+            budget.take((old_bytes.len() + new_bytes.len()) as u64, &path)?;
+            // skip likely-binary blobs (each blob is now hard-capped at
+            // MAX_BLOB_BYTES, and the total diff budget above is enforced)
             if old_bytes.contains(&0) || new_bytes.contains(&0) {
                 measured.insert(
                     path.clone(),
@@ -603,9 +648,24 @@ pub struct ArtifactsMergePort {
 }
 
 impl ArtifactsMergePort {
-    fn git(&self, dir: &Path, args: &[&str], token_secret: &str) -> Result<String, String> {
-        let out = std::process::Command::new("git")
-            .args(args)
+    /// L6 (cycle-06 audit): hostile local git config (custom merge drivers,
+    /// merge.conflictstyle, core.hooksPath) must not alter merge semantics.
+    /// Every git invocation ignores system + global config files.
+    fn pinned_git_env() -> [(&'static str, &'static str); 2] {
+        [
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ]
+    }
+
+    /// -c overrides for the merge invocation (must precede the subcommand).
+    fn merge_pin_args() -> [&'static str; 2] {
+        ["-c", "merge.conflictstyle=merge"]
+    }
+
+    fn git_cmd(dir: &Path, args: &[&str], token_secret: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(args)
             .current_dir(dir)
             .env("GIT_AUTHOR_NAME", "wreck-governor")
             .env("GIT_AUTHOR_EMAIL", "wreck@local")
@@ -614,7 +674,15 @@ impl ArtifactsMergePort {
             .env(
                 "GIT_HTTP_EXTRAHEADER",
                 format!("Authorization: Bearer {}", token_secret),
-            )
+            );
+        for (k, v) in Self::pinned_git_env() {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    fn git(&self, dir: &Path, args: &[&str], token_secret: &str) -> Result<String, String> {
+        let out = Self::git_cmd(dir, args, token_secret)
             .output()
             .map_err(|e| format!("artifacts git: {}", e))?;
         if !out.status.success() {
@@ -669,9 +737,12 @@ impl wreck_governor::MergePort for ArtifactsMergePort {
             &["fetch", "--depth", "1", &fork_remote, change.head.as_str()],
             &secret,
         )?;
+        let pin = Self::merge_pin_args();
         self.git(
             &dir,
             &[
+                pin[0],
+                pin[1],
                 "merge",
                 "--no-ff",
                 "-m",
@@ -867,5 +938,75 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert_eq!(m["a.txt"], "ha");
         assert_eq!(m["sub/b.txt"], "hb");
+    }
+
+    // --- L3 (cycle-09): capped reads + total diff budget -----------------
+
+    #[test]
+    fn read_capped_accepts_at_cap() {
+        use std::io::Cursor;
+        let data = vec![0xABu8; 100];
+        let out = read_capped(Cursor::new(data), 100, "test").unwrap();
+        assert_eq!(out.len(), 100);
+    }
+
+    #[test]
+    fn read_capped_rejects_over_cap() {
+        use std::io::Cursor;
+        let data = vec![0xABu8; 101];
+        let err = read_capped(Cursor::new(data), 100, "test").unwrap_err();
+        assert!(err.contains("exceeds 100 byte cap"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn read_capped_accepts_empty() {
+        use std::io::Cursor;
+        let out = read_capped(Cursor::new(vec![]), 100, "test").unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn byte_budget_exhausts_fail_closed() {
+        let mut b = ByteBudget::new(100);
+        b.take(60, "a").unwrap();
+        b.take(40, "b").unwrap();
+        let err = b.take(1, "c").unwrap_err();
+        assert!(err.contains("total budget"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn byte_budget_single_take_over_cap() {
+        let mut b = ByteBudget::new(100);
+        assert!(b.take(101, "x").is_err());
+    }
+
+    // --- L6 (cycle-09): pinned git config --------------------------------
+
+    #[test]
+    fn git_env_pins_config_files_off() {
+        let cmd = ArtifactsMergePort::git_cmd(std::path::Path::new("/tmp"), &["status"], "sekret");
+        // get_envs yields (key, Option<value>); explicitly-removed values are None.
+        let env_of = |k: &str| -> Option<String> {
+            cmd.get_envs()
+                .filter_map(|(key, val)| {
+                    if key == k {
+                        val.and_then(|v| v.to_str()).map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .next()
+        };
+        assert_eq!(env_of("GIT_CONFIG_NOSYSTEM"), Some("1".to_string()));
+        assert_eq!(env_of("GIT_CONFIG_GLOBAL"), Some("/dev/null".to_string()));
+        // auth header still present (ps-safe: env, never argv)
+        let extra = env_of("GIT_HTTP_EXTRAHEADER").unwrap_or_default();
+        assert!(extra.starts_with("Authorization: Bearer "));
+    }
+
+    #[test]
+    fn merge_pins_conflictstyle() {
+        let pin = ArtifactsMergePort::merge_pin_args();
+        assert_eq!(pin, ["-c", "merge.conflictstyle=merge"]);
     }
 }

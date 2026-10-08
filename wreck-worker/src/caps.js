@@ -43,6 +43,58 @@ export function utf8Len(str) {
 }
 
 /**
+ * L4 (cycle-06 audit): measure the JSON encoding length of a value WITHOUT
+ * materializing the full string. The old handleMessage did
+ * utf8Len(JSON.stringify(msg.body)) — building a second full copy of the
+ * body before the cap check, deviating from the #668 "cap before touch"
+ * pattern. This walks the value incrementally and throws CapExceeded the
+ * moment the running total exceeds cap: the accumulator never holds more
+ * than cap + one JSON atom. Slightly conservative around undefined-valued
+ * object keys (counted, then dropped by JSON.stringify) — fail-closed
+ * direction, never under-counts.
+ */
+export function measureJsonBytes(value, cap, what) {
+  const enc = new TextEncoder();
+  let total = 0;
+  const add = (n) => {
+    total += n;
+    if (total > cap) throw new CapExceeded(what, total, cap);
+  };
+  (function walk(v) {
+    if (v === null || v === undefined) return add(v === null ? 4 : 0);
+    switch (typeof v) {
+      case "boolean":
+        return add(v ? 4 : 5);
+      case "number":
+        return add(enc.encode(String(v)).length);
+      case "string":
+        return add(enc.encode(JSON.stringify(v)).length);
+      case "object":
+        if (Array.isArray(v)) {
+          add(2); // [ ]
+          for (let i = 0; i < v.length; i++) {
+            if (i > 0) add(1);
+            walk(v[i]);
+          }
+          return;
+        }
+        add(2); // { }
+        let first = true;
+        for (const k of Object.keys(v)) {
+          if (!first) add(1);
+          first = false;
+          add(enc.encode(JSON.stringify(k)).length + 1); // "k":
+          walk(v[k]);
+        }
+        return;
+      default:
+        return; // function/symbol/bigint: dropped by JSON.stringify
+    }
+  })(value);
+  return total;
+}
+
+/**
  * Stream-decode a WHATWG byte stream with a byte cap — the readTextCapped
  * shape: rejects (never truncates) over-limit bodies, cancels the reader
  * immediately on violation. For future fetch surfaces on this Worker.

@@ -221,10 +221,25 @@ impl<M: Minter> TokenCustodian<M> {
     }
 
     /// Adjudicate a provider rejection against the PRESENTED token.
+    /// L2 (cycle-06 audit): the presented token is attacker-influenced; `==`
+    /// leaks prefix-match timing to a local observer. Constant-time over
+    /// the bytes. Length still leaks (tokens are fixed-format) — acceptable.
+    fn ct_eq(a: &str, b: &str) -> bool {
+        let (x, y) = (a.as_bytes(), b.as_bytes());
+        if x.len() != y.len() {
+            return false;
+        }
+        let mut acc = 0u8;
+        for i in 0..x.len() {
+            acc |= x[i] ^ y[i];
+        }
+        acc == 0
+    }
+
     pub fn adjudicate(&self, repo: &str, presented: &str) -> Adjudication {
         let st = self.state.lock().unwrap();
         match st.cached.get(repo) {
-            Some(c) if c.plaintext == presented => Adjudication::Current,
+            Some(c) if Self::ct_eq(&c.plaintext, presented) => Adjudication::Current,
             Some(_) => Adjudication::Superseded,
             None => Adjudication::Current, // fail-closed: refresh past it
         }
@@ -292,10 +307,20 @@ mod tests {
             )
         }
         fn mint_count(&self) -> usize {
-            self.calls.lock().unwrap().iter().filter(|c| c.starts_with("mint")).count()
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.starts_with("mint"))
+                .count()
         }
         fn revoke_count(&self) -> usize {
-            self.calls.lock().unwrap().iter().filter(|c| c.starts_with("revoke")).count()
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.starts_with("revoke"))
+                .count()
         }
         fn revoked_ids(&self) -> Vec<String> {
             self.calls
@@ -326,7 +351,10 @@ mod tests {
             })
         }
         fn revoke(&self, token_id: &str) -> Result<(), String> {
-            self.calls.lock().unwrap().push(format!("revoke {}", token_id));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("revoke {}", token_id));
             Ok(())
         }
     }
@@ -413,7 +441,9 @@ mod tests {
         // leader starts a mint and blocks inside it
         let c2 = c.clone();
         let h = thread::spawn(move || c2.token_for("r").unwrap());
-        entered.recv_timeout(Duration::from_secs(5)).expect("leader entered mint");
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("leader entered mint");
         // rotate lands mid-mint: fences the in-flight mint out
         c.rotate("r");
         // release the mint; the leader must discard, not store
@@ -476,6 +506,29 @@ mod tests {
         assert_ne!(t1, t2);
         assert_eq!(c.adjudicate("r", &t1), Adjudication::Superseded);
     }
+
+    // --- L2 (cycle-09): constant-time token comparison --------------------
+
+    #[test]
+    fn ct_eq_equal() {
+        assert!(TokenCustodian::<FakeMinterRef>::ct_eq("abc123", "abc123"));
+    }
+
+    #[test]
+    fn ct_eq_differs_one_byte() {
+        assert!(!TokenCustodian::<FakeMinterRef>::ct_eq("abc123", "abc124"));
+    }
+
+    #[test]
+    fn ct_eq_length_mismatch() {
+        assert!(!TokenCustodian::<FakeMinterRef>::ct_eq("abc123", "abc12"));
+        assert!(!TokenCustodian::<FakeMinterRef>::ct_eq("", "x"));
+    }
+
+    #[test]
+    fn ct_eq_empty() {
+        assert!(TokenCustodian::<FakeMinterRef>::ct_eq("", ""));
+    }
 }
 
 #[cfg(test)]
@@ -491,7 +544,11 @@ mod h4_redaction_tests {
         };
         let dbg = format!("{:?}", t);
         assert!(!dbg.contains("SUPERSECRET"), "leaked: {}", dbg);
-        assert!(dbg.contains("<redacted>"), "missing redaction marker: {}", dbg);
+        assert!(
+            dbg.contains("<redacted>"),
+            "missing redaction marker: {}",
+            dbg
+        );
         // non-secret fields still visible for operability
         assert!(dbg.contains("tok-1"), "id lost: {}", dbg);
     }

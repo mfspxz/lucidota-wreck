@@ -6,6 +6,7 @@ import {
   EVENT_CAP,
   WASM_INPUT_CAP,
   checkCap,
+  measureJsonBytes,
   readTextCapped,
   utf8Len,
 } from "./caps.js";
@@ -91,4 +92,53 @@ test("event envelope at 16 KiB boundary: realistic push event passes", () => {
     payload: { ref: "refs/heads/main", before: "a".repeat(40), after: "b".repeat(40) },
   };
   checkCap(utf8Len(JSON.stringify(event)), EVENT_CAP, "push event payload");
+});
+
+// ---------- L4: measure-before-materialize ----------
+
+test("L4: measureJsonBytes agrees with JSON.stringify length", () => {
+  const v = {
+    a: "héllo wörld",
+    n: 42,
+    f: 1.5,
+    b: true,
+    z: null,
+    arr: [1, "x", null, false],
+    nested: { deep: { deeper: [1, 2, 3] } },
+    undef: undefined, // dropped by JSON.stringify; measured conservatively
+  };
+  const measured = measureJsonBytes(v, EVENT_CAP, "probe");
+  const actual = utf8Len(JSON.stringify(v));
+  assert.ok(measured >= actual, `measured ${measured} < actual ${actual}`);
+  assert.ok(measured - actual < 100, `too conservative: ${measured} vs ${actual}`);
+});
+
+test("L4: over-cap object throws CapExceeded without full materialization", () => {
+  // a 1MB nested object: the measurer must throw CapExceeded (16 KiB cap)
+  // without ever building the 1MB string
+  const big = { chunks: Array.from({ length: 2000 }, (_, i) => "x".repeat(500) + i) };
+  assert.throws(() => measureJsonBytes(big, EVENT_CAP, "probe"), CapExceeded);
+});
+
+test("L4: over-cap string measured directly by byte length", () => {
+  const s = "y".repeat(EVENT_CAP + 1);
+  assert.throws(() => checkCap(utf8Len(s), EVENT_CAP, "probe"), CapExceeded);
+  checkCap(utf8Len("y".repeat(EVENT_CAP)), EVENT_CAP, "probe");
+});
+
+test("L4: unicode string length counted in UTF-8 bytes, not chars", () => {
+  const s = "é".repeat(9000); // 9000 chars = 18000 bytes > 16 KiB
+  assert.throws(() => measureJsonBytes({ s }, EVENT_CAP, "probe"), CapExceeded);
+  const ok = { s: "é".repeat(8000) }; // 16000 bytes < 16 KiB
+  measureJsonBytes(ok, EVENT_CAP, "probe");
+});
+
+test("L4: scalars and empty structures measured", () => {
+  assert.equal(measureJsonBytes(null, EVENT_CAP, "p"), 4);
+  assert.equal(measureJsonBytes(true, EVENT_CAP, "p"), 4);
+  assert.equal(measureJsonBytes(false, EVENT_CAP, "p"), 5);
+  assert.equal(measureJsonBytes(42, EVENT_CAP, "p"), 2);
+  assert.equal(measureJsonBytes("", EVENT_CAP, "p"), 2);
+  assert.equal(measureJsonBytes([], EVENT_CAP, "p"), 2);
+  assert.equal(measureJsonBytes({}, EVENT_CAP, "p"), 2);
 });
