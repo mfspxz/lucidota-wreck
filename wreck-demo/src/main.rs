@@ -194,7 +194,22 @@ fn main() {
         };
         let refs: Vec<(&str, &str)> = new_content.iter().map(|(p, c)| (*p, c.as_str())).collect();
         let head = git.commit_change(&fork, &refs, &format!("{}: {}", w.id, w.intent)).expect("commit");
-        let (claim, invs) = mk_claim(w.id, w.agent, base.clone(), head.clone(), w.intent, w.scope.clone(), &w.invariants);
+        let (mut claim, invs) = mk_claim(w.id, w.agent, base.clone(), head.clone(), w.intent, w.scope.clone(), &w.invariants);
+        // the claim rides WITH the push: amend the commit message with the trailer.
+        // (the push event's `after` SHA stays authoritative for the head;
+        // the trailer carries the semantic proposal: intent/scope/claims/evidence)
+        let trailer_msg = format!("{}: {}\n\n{}", w.id, w.intent, claim.to_trailer());
+        let head = amend_trailer(&fork, &trailer_msg);
+        claim.head = head.clone();
+        // sanity: the trailer parses back
+        let check = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(&fork)
+            .output()
+            .expect("log");
+        let parsed = ChangeClaim::from_trailer(&String::from_utf8_lossy(&check.stdout))
+            .expect("trailer parses");
+        assert_eq!(parsed.change_id, w.id);
         let mut view = git.diff_view(w.id, &w.scope, &fork, &base, &head).expect("diff");
         // symbols: measured via tree-sitter, not declared
         git.measure_symbols(&fork, &head, &mut view).expect("measure");
@@ -345,4 +360,25 @@ fn short(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+fn amend_trailer(fork: &std::path::Path, msg: &str) -> wreck_protocol::Sha {
+    let out = std::process::Command::new("git")
+        .args(["commit", "--amend", "-m", msg])
+        .current_dir(fork)
+        .env("GIT_AUTHOR_NAME", "wreck")
+        .env("GIT_AUTHOR_EMAIL", "wreck@local")
+        .env("GIT_COMMITTER_NAME", "wreck")
+        .env("GIT_COMMITTER_EMAIL", "wreck@local")
+        .env("GIT_AUTHOR_DATE", "2026-10-08T21:00:00+00:00")
+        .env("GIT_COMMITTER_DATE", "2026-10-08T21:00:00+00:00")
+        .output()
+        .expect("amend");
+    assert!(out.status.success(), "amend failed");
+    let sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(fork)
+        .output()
+        .expect("rev-parse");
+    wreck_protocol::Sha::new(String::from_utf8_lossy(&sha.stdout).trim()).unwrap()
 }

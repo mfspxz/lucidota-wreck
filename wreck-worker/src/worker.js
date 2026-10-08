@@ -172,8 +172,34 @@ function diffRanges(oldText, newText) {
 }
 
 function claimFromCommit(event, after) {
-  // TODO: parse `Wreck-Claim:` trailer from the commit message.
-  throw new Error("scaffold: claimFromCommit not yet implemented");
+  // The claim rides the push: parse the `Wreck-Claim:` trailer from the
+  // commit message (present in the push event's commits[] — zero extra reads).
+  // The event's `after` SHA stays authoritative for the head; the trailer
+  // carries the semantic proposal (intent/scope/claims/evidence).
+  // Without a trailer the governor still runs on the measured diff,
+  // with zero declared semantics.
+  const msg = (after.message || "");
+  const line = msg.split("\n").find((l) => l.startsWith("Wreck-Claim:"));
+  const base = {
+    change_id: event.repo,
+    agent_id: (after.author && after.author.name) || "unknown",
+    task_id: "unknown",
+    base: event.before,
+    head: event.after,
+    intent: msg.split("\n")[0] || "",
+    scope: [],
+    claims: [],
+    evidence: [],
+    dependencies: [],
+    status: "PROPOSED",
+  };
+  if (!line) return base;
+  try {
+    const claimed = JSON.parse(line.slice("Wreck-Claim:".length).trim());
+    return { ...base, ...claimed, base: event.before, head: event.after, status: "PROPOSED" };
+  } catch {
+    return base;
+  }
 }
 
 async function inFlightViews(env, namespace) {

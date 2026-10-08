@@ -171,6 +171,21 @@ impl ChangeClaim {
         }
     }
 
+    /// Serialize as a git commit trailer: `Wreck-Claim: <compact json>`.
+    /// The claim rides the push event's commit message — the Worker's
+    /// claimFromCommit parses it with zero extra subrequests.
+    pub fn to_trailer(&self) -> String {
+        format!("Wreck-Claim: {}", serde_json::to_string(self).unwrap_or_default())
+    }
+
+    /// Parse the first `Wreck-Claim:` trailer from a commit message.
+    pub fn from_trailer(msg: &str) -> Option<Self> {
+        msg.lines()
+            .filter_map(|l| l.strip_prefix("Wreck-Claim:"))
+            .next()
+            .and_then(|j| serde_json::from_str(j.trim()).ok())
+    }
+
     /// Forward-only transition. Errors on any backward or skipped step.
     pub fn transition(&mut self, next: ChangeStatus) -> Result<(), String> {
         if self.status.is_terminal() {
@@ -514,5 +529,26 @@ mod tests {
         let back: ChangeClaim = serde_json::from_str(&json).unwrap();
         assert_eq!(back.change_id, "wreck-7");
         assert_eq!(back.scope.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod trailer_tests {
+    use super::*;
+
+    #[test]
+    fn trailer_roundtrip() {
+        let mut c = ChangeClaim::propose(
+            "wreck-t", "a1", "t1",
+            Sha::new(&"a".repeat(40)).unwrap(),
+            Sha::new(&"b".repeat(40)).unwrap(),
+            "do the thing",
+        );
+        c.scope.push(ScopeItem::File { path: "src/x.rs".into() });
+        let msg = format!("do the thing\n\n{}", c.to_trailer());
+        let back = ChangeClaim::from_trailer(&msg).unwrap();
+        assert_eq!(back.change_id, "wreck-t");
+        assert_eq!(back.intent, "do the thing");
+        assert!(ChangeClaim::from_trailer("no trailer here").is_none());
     }
 }

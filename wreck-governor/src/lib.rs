@@ -120,6 +120,35 @@ impl Governor {
         Ok(())
     }
 
+    /// CHECKED gate: scope attestation. Every file the diff actually
+    /// touched must be in the agent's declared scope. An agent that hides
+    /// changed files from its claim is rejected — the governor measures,
+    /// the agent declares, and the two must agree.
+    fn check_scope_attestation(change: &ChangeClaim, view: &ChangeView) -> Result<(), String> {
+        use wreck_protocol::ScopeItem;
+        let declared: std::collections::HashSet<&str> = change
+            .scope
+            .iter()
+            .filter_map(|s| match s {
+                ScopeItem::File { path } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        // No declared files = no attestation to check (measured diff rules).
+        if declared.is_empty() {
+            return Ok(());
+        }
+        for f in &view.files {
+            if !declared.contains(f.path.as_str()) {
+                return Err(format!(
+                    "scope attestation failed: measured change to {} not in declared scope",
+                    f.path
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Run one change through the full pipeline. Mutates the claim's status.
     /// Resumable: a Blocked claim sitting at PROVEN re-enters cleanly.
     /// Returns the sealed decision record.
@@ -178,6 +207,13 @@ impl Governor {
         if let Err(reason) = Self::check_evidence(change) {
             return Ok(DecideOutcome::Decided(
                 self.reject(change, reason, "EVIDENCE-01".to_string(), vec![], ts)?,
+            ));
+        }
+
+        // --- CHECKED: scope attestation (measured vs declared) ---
+        if let Err(reason) = Self::check_scope_attestation(change, view) {
+            return Ok(DecideOutcome::Decided(
+                self.reject(change, reason, "SCOPE-01".to_string(), vec![], ts)?,
             ));
         }
 
@@ -482,5 +518,58 @@ mod tests {
         let s1 = d1.receipt.get("seal").and_then(|v| v.as_str()).unwrap();
         assert_eq!(d2.receipt.get("prev_hash").and_then(|v| v.as_str()), Some(s1));
         assert_eq!(g.decisions_sealed(), 2);
+    }
+}
+
+#[cfg(test)]
+mod attestation_tests {
+    use super::*;
+    use wreck_graph::FileChange;
+    use wreck_protocol::{Claim, ClaimKind, Evidence, EvidenceKind, ScopeItem};
+
+    struct FakeMerger;
+    impl MergePort for FakeMerger {
+        fn merge(&self, _c: &ChangeClaim) -> Result<Sha, String> {
+            Sha::new(&"f".repeat(40))
+        }
+        fn name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    #[test]
+    fn hidden_file_is_rejected() {
+        let mut gov = Governor::new(Policy::default(), b"test-key-32-bytes-long-padding!!".to_vec(), "g");
+        // agent declares only src/a.rs but the diff touches src/evil.rs
+        let mut c = ChangeClaim::propose(
+            "w-sneaky", "agent-x", "t1",
+            Sha::new(&"a".repeat(40)).unwrap(),
+            Sha::new(&"b".repeat(40)).unwrap(),
+            "innocent refactor",
+        );
+        c.scope = vec![ScopeItem::File { path: "src/a.rs".into() }];
+        c.claims.push(Claim { id: "C1".into(), statement: "s".into(), kind: ClaimKind::PreservesApi });
+        c.evidence.push(Evidence {
+            id: "C1-E1".into(), kind: EvidenceKind::Test,
+            reference: "C1: t".into(), digest: "sha256:x".into(),
+        });
+        let v = ChangeView {
+            change_id: "w-sneaky".into(),
+            files: vec![
+                FileChange { path: "src/a.rs".into(), added: vec![(1, 2)], removed: vec![] },
+                FileChange { path: "src/evil.rs".into(), added: vec![(1, 50)], removed: vec![] },
+            ],
+            ..Default::default()
+        };
+        let d = gov
+            .evaluate(&mut c, &v, &[], &std::collections::HashSet::new(), &FakeMerger, "2026-10-08T23:00:00Z")
+            .unwrap();
+        match &d.verdict {
+            Verdict::Reject { reason, rule } => {
+                assert_eq!(rule, "SCOPE-01");
+                assert!(reason.contains("src/evil.rs"), "reason: {}", reason);
+            }
+            v => panic!("expected SCOPE-01 reject, got {:?}", v),
+        }
     }
 }
