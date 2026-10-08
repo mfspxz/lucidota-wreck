@@ -7,6 +7,8 @@
 
 pub mod artifacts;
 pub mod local;
+pub mod token_custodian;
 
 pub use artifacts::{ArtifactsClient, ArtifactsMergePort, PushedEvent};
 pub use local::{LocalGit, LocalMergePort};
+pub use token_custodian::{Adjudication, MintedToken, Minter, TokenCustodian};
