@@ -148,6 +148,27 @@ pub struct ChangeClaim {
 }
 
 impl ChangeClaim {
+    /// Validate a change_id at the boundary. Mirrors the Artifacts repo-name
+    /// rule: `^[A-Za-z0-9][A-Za-z0-9._-]{1,62}$`. Rejects path separators
+    /// (`../../x` → merge-dir traversal in ArtifactsMergePort), `..`,
+    /// newlines (commit-message injection), and empty/1-char ids.
+    /// The change_id is agent-influenced via the `Wreck-Claim:` trailer, so
+    /// it must never become a filesystem or shell capability unchecked.
+    pub fn validate_change_id(id: &str) -> Result<(), String> {
+        let bytes = id.as_bytes();
+        let ok = bytes.len() >= 2
+            && bytes.len() <= 63
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'-' || *b == b'_');
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("wreck-protocol: invalid change_id {:?}", id))
+        }
+    }
+
     pub fn propose(
         change_id: &str,
         agent_id: &str,
@@ -155,8 +176,9 @@ impl ChangeClaim {
         base: Sha,
         head: Sha,
         intent: &str,
-    ) -> Self {
-        ChangeClaim {
+    ) -> Result<Self, String> {
+        Self::validate_change_id(change_id)?;
+        Ok(ChangeClaim {
             change_id: change_id.to_string(),
             agent_id: agent_id.to_string(),
             task_id: task_id.to_string(),
@@ -168,7 +190,7 @@ impl ChangeClaim {
             evidence: vec![],
             dependencies: vec![],
             status: ChangeStatus::Proposed,
-        }
+        })
     }
 
     /// Serialize as a git commit trailer: `Wreck-Claim: <compact json>`.
@@ -179,11 +201,14 @@ impl ChangeClaim {
     }
 
     /// Parse the first `Wreck-Claim:` trailer from a commit message.
+    /// The change_id is re-validated here: the trailer is agent-influenced
+    /// input, so an invalid id rejects the whole claim (returns None).
     pub fn from_trailer(msg: &str) -> Option<Self> {
         msg.lines()
             .filter_map(|l| l.strip_prefix("Wreck-Claim:"))
             .next()
             .and_then(|j| serde_json::from_str(j.trim()).ok())
+            .and_then(|c: Self| Self::validate_change_id(&c.change_id).ok().map(|_| c))
     }
 
     /// Forward-only transition. Errors on any backward or skipped step.
@@ -405,7 +430,7 @@ mod tests {
 
     #[test]
     fn transitions_are_forward_only() {
-        let mut c = ChangeClaim::propose("wreck-1", "a1", "t1", sha('a'), sha('b'), "test");
+        let mut c = ChangeClaim::propose("wreck-1", "a1", "t1", sha('a'), sha('b'), "test").expect("valid change_id");
         assert!(c.transition(ChangeStatus::Observed).is_ok());
         assert!(c.transition(ChangeStatus::Proposed).is_err()); // backward
         assert!(c.transition(ChangeStatus::Proven).is_err()); // skip
@@ -416,7 +441,7 @@ mod tests {
 
     #[test]
     fn happy_path_to_merged() {
-        let mut c = ChangeClaim::propose("wreck-2", "a1", "t1", sha('a'), sha('b'), "test");
+        let mut c = ChangeClaim::propose("wreck-2", "a1", "t1", sha('a'), sha('b'), "test").expect("valid change_id");
         for s in [
             ChangeStatus::Observed,
             ChangeStatus::Checked,
@@ -432,7 +457,7 @@ mod tests {
     #[test]
     fn decision_hash_is_deterministic() {
         let mk = || {
-            let c = ChangeClaim::propose("wreck-3", "a1", "t1", sha('a'), sha('b'), "x");
+            let c = ChangeClaim::propose("wreck-3", "a1", "t1", sha('a'), sha('b'), "x").expect("valid change_id");
             DecisionRecord::draft(
                 &c,
                 Verdict::Accept,
@@ -456,7 +481,7 @@ mod tests {
     #[test]
     fn seal_and_verify_roundtrip() {
         let key = b"test-authority-key-32-bytes-long!!!!";
-        let c = ChangeClaim::propose("wreck-4", "a1", "t1", sha('a'), sha('b'), "x");
+        let c = ChangeClaim::propose("wreck-4", "a1", "t1", sha('a'), sha('b'), "x").expect("valid change_id");
         let mut d = DecisionRecord::draft(
             &c,
             Verdict::Accept,
@@ -482,7 +507,7 @@ mod tests {
         );
         // chain verification over two decisions
         let seal1 = d.receipt.get("seal").and_then(|v| v.as_str()).unwrap().to_string();
-        let c2 = ChangeClaim::propose("wreck-5", "a2", "t1", sha('b'), sha('c'), "y");
+        let c2 = ChangeClaim::propose("wreck-5", "a2", "t1", sha('b'), sha('c'), "y").expect("valid change_id");
         let mut d2 = DecisionRecord::draft(
             &c2,
             Verdict::Reject { reason: "policy".into(), rule: "CANON-31".into() },
@@ -504,7 +529,7 @@ mod tests {
 
     #[test]
     fn reject_reachable_past_proposed_only() {
-        let mut c = ChangeClaim::propose("wreck-6", "a1", "t1", sha('a'), sha('b'), "x");
+        let mut c = ChangeClaim::propose("wreck-6", "a1", "t1", sha('a'), sha('b'), "x").expect("valid change_id");
         assert!(c.transition(ChangeStatus::Rejected).is_err()); // not from Proposed
         c.transition(ChangeStatus::Observed).unwrap();
         c.transition(ChangeStatus::Rejected).unwrap(); // legal from Observed
@@ -512,7 +537,7 @@ mod tests {
 
     #[test]
     fn schema_json_roundtrip() {
-        let mut c = ChangeClaim::propose("wreck-7", "agent-a", "task-42", sha('a'), sha('b'), "improve auth timeout");
+        let mut c = ChangeClaim::propose("wreck-7", "agent-a", "task-42", sha('a'), sha('b'), "improve auth timeout").expect("valid change_id");
         c.scope.push(ScopeItem::File { path: "src/auth.rs".into() });
         c.claims.push(Claim {
             id: "C1".into(),
@@ -543,12 +568,57 @@ mod trailer_tests {
             Sha::new(&"a".repeat(40)).unwrap(),
             Sha::new(&"b".repeat(40)).unwrap(),
             "do the thing",
-        );
+        ).expect("valid change_id");
         c.scope.push(ScopeItem::File { path: "src/x.rs".into() });
         let msg = format!("do the thing\n\n{}", c.to_trailer());
         let back = ChangeClaim::from_trailer(&msg).unwrap();
         assert_eq!(back.change_id, "wreck-t");
         assert_eq!(back.intent, "do the thing");
         assert!(ChangeClaim::from_trailer("no trailer here").is_none());
+    }
+
+    // H5 regression: change_id is validated at claim intake.
+    fn sha(c: char) -> Sha {
+        Sha::new(&c.to_string().repeat(40)).unwrap()
+    }
+
+    #[test]
+    fn change_id_charset_accepts_repo_style_ids() {
+        for id in ["wreck-1", "w-2", "agent-0", "scale-003", "a_b.c-d", "AB12"] {
+            assert!(ChangeClaim::validate_change_id(id).is_ok(), "id: {}", id);
+            assert!(
+                ChangeClaim::propose(id, "a", "t", sha('a'), sha('b'), "x").is_ok(),
+                "id: {}",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn change_id_rejects_path_traversal() {
+        for id in ["../../x", "..", "../evil", "a/b", "/abs", "x\\y"] {
+            assert!(ChangeClaim::validate_change_id(id).is_err(), "id: {}", id);
+            assert!(
+                ChangeClaim::propose(id, "a", "t", sha('a'), sha('b'), "x").is_err(),
+                "id: {}",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn change_id_rejects_injection_and_bad_lengths() {
+        for id in ["", "x", "a\nb: injected", "a b", "a;b", "a$b", &"a".repeat(64)] {
+            assert!(ChangeClaim::validate_change_id(id).is_err(), "id: {:?}", id);
+        }
+        // 63 chars is the max (mirrors Artifacts repo-name rule)
+        assert!(ChangeClaim::validate_change_id(&"a".repeat(63)).is_ok());
+    }
+
+    #[test]
+    fn trailer_with_invalid_change_id_is_rejected() {
+        // agent-influenced trailer carrying a traversal id must not parse
+        let evil = r#"Wreck-Claim: {"change_id":"../../evil","agent_id":"a","task_id":"t","base":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","head":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","intent":"x","scope":[],"claims":[],"evidence":[],"dependencies":[],"status":"Proposed"}"#;
+        assert!(ChangeClaim::from_trailer(evil).is_none());
     }
 }

@@ -111,7 +111,7 @@ fn main() {
             .commit_change(&fork, &[(&path, &new_content)], &format!("{}: work", id))
             .expect("commit");
 
-        let mut c = ChangeClaim::propose(&id, &format!("agent-{}", i), "task-scale", base.clone(), head.clone(), "scale work");
+        let mut c = ChangeClaim::propose(&id, &format!("agent-{}", i), "task-scale", base.clone(), head.clone(), "scale work").expect("valid change_id");
         c.scope = scope.clone();
         c.claims.push(Claim { id: "C1".into(), statement: "safe".into(), kind: ClaimKind::PreservesApi });
         c.evidence.push(Evidence {

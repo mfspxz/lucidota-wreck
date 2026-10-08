@@ -80,7 +80,7 @@ fn mk_claim(
     scope: Vec<ScopeItem>,
     invariants: &[&str],
 ) -> (ChangeClaim, Vec<String>) {
-    let mut c = ChangeClaim::propose(id, agent, "task-auth-001", base, head, intent);
+    let mut c = ChangeClaim::propose(id, agent, "task-auth-001", base, head, intent).expect("valid change_id");
     c.scope = scope;
     c.claims.push(Claim {
         id: "C1".into(),

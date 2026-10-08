@@ -39,11 +39,24 @@ pub const DEFAULT_SKEW_SECS: u64 = 60;
 
 /// A self-contained token record. The custodian hands `plaintext` to
 /// callers; `id` is for revocation; `expires_at_unix` drives skew refresh.
-#[derive(Debug, Clone)]
+///
+/// H4 (cycle-06 audit): hand-written Debug — plaintext must never appear
+/// in logs via a stray `{:?}`.
+#[derive(Clone)]
 pub struct MintedToken {
     pub id: String,
     pub plaintext: String,
     pub expires_at_unix: u64,
+}
+
+impl std::fmt::Debug for MintedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedToken")
+            .field("id", &self.id)
+            .field("plaintext", &"<redacted>")
+            .field("expires_at_unix", &self.expires_at_unix)
+            .finish()
+    }
 }
 
 /// The minting capability. Implementations hold the refresh material
@@ -462,5 +475,24 @@ mod tests {
         let t2 = c.token_for("r").unwrap();
         assert_ne!(t1, t2);
         assert_eq!(c.adjudicate("r", &t1), Adjudication::Superseded);
+    }
+}
+
+#[cfg(test)]
+mod h4_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn minted_token_debug_redacts_plaintext() {
+        let t = MintedToken {
+            id: "tok-1".into(),
+            plaintext: "art_v1_SUPERSECRET?expires=123".into(),
+            expires_at_unix: 999,
+        };
+        let dbg = format!("{:?}", t);
+        assert!(!dbg.contains("SUPERSECRET"), "leaked: {}", dbg);
+        assert!(dbg.contains("<redacted>"), "missing redaction marker: {}", dbg);
+        // non-secret fields still visible for operability
+        assert!(dbg.contains("tok-1"), "id lost: {}", dbg);
     }
 }

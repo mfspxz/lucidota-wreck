@@ -1,8 +1,14 @@
 //! wreck-wasm: the governor core compiled for Cloudflare Workers.
 //!
 //! JSON-in / JSON-out ABI (no wasm-bindgen needed):
+//!   wreck_init_key(key_ptr, key_len) -> i32 (0 ok, negative on error)
 //!   wreck_decide(in_ptr, in_len, out_ptr, out_cap) -> i32 (bytes written, or -1)
 //!   wreck_complete(in_ptr, in_len, out_ptr, out_cap) -> i32
+//!
+//! AUTHORITY KEY (H1, cycle-06 audit): the sealing key is installed ONCE via
+//! wreck_init_key into WASM-static memory. It NEVER crosses the JS→WASM
+//! boundary again — decide/complete inputs carry no key material. Re-init
+//! zeroizes the previous key before installing the new one.
 //!
 //! INPUT CAP (thread 6, cloudflare-os #668 readTextCapped pattern):
 //! inputs over MAX_INPUT_BYTES (1 MiB) are rejected with {"error":...} —
@@ -11,20 +17,68 @@
 //!
 //! Input (decide):
 //!   { "claim": ChangeClaim, "view": ChangeView, "in_flight": [ChangeView],
-//!     "merged": [change_id], "policy": Policy, "key_hex": "...", "actor": "...", "ts": "..." }
+//!     "merged": [change_id], "policy": Policy, "actor": "...", "ts": "..." }
 //! Output (decide): { "claim": ChangeClaim, "outcome": "accept_pending"|"decided",
 //!                    "draft": DecisionRecord|null, "decision": DecisionRecord|null }
 //! Input (complete): { "draft": DecisionRecord, "claim": ChangeClaim,
-//!                     "merge_sha": "...", "port": "...", "key_hex": "...",
+//!                     "merge_sha": "...", "port": "...",
 //!                     "actor": "...", "ts": "..." }
 //! Output (complete): { "claim": ChangeClaim, "decision": DecisionRecord }
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::slice;
+use std::sync::Mutex;
 use wreck_governor::{DecideOutcome, Governor};
 use wreck_graph::{ChangeView, Policy};
 use wreck_protocol::{ChangeClaim, DecisionRecord, Sha};
+
+/// The installed authority key. Installed once via wreck_init_key;
+/// cloned out per decision (the Governor takes ownership).
+static AUTHORITY_KEY: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// Max authority-key size: HMAC keys are small; anything larger is a bug.
+const MAX_KEY_BYTES: usize = 256;
+
+fn zeroize(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    // keep the compiler from optimizing the wipe away
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+fn install_key(key: &[u8]) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("wreck: refusing to install an empty authority key".into());
+    }
+    if key.len() > MAX_KEY_BYTES {
+        return Err(format!(
+            "wreck: authority key {} bytes exceeds {} byte cap",
+            key.len(),
+            MAX_KEY_BYTES
+        ));
+    }
+    let mut guard = AUTHORITY_KEY
+        .lock()
+        .map_err(|_| "wreck: authority key lock poisoned".to_string())?;
+    // zeroize the previous key before replacing it
+    if let Some(mut old) = guard.take() {
+        zeroize(&mut old);
+    }
+    *guard = Some(key.to_vec());
+    Ok(())
+}
+
+fn authority_key() -> Result<Vec<u8>, String> {
+    AUTHORITY_KEY
+        .lock()
+        .map_err(|_| "wreck: authority key lock poisoned".to_string())?
+        .clone()
+        .ok_or_else(|| {
+            "wreck: authority key not installed — call wreck_init_key first".to_string()
+        })
+}
 
 #[derive(Deserialize)]
 struct DecideInput {
@@ -33,7 +87,6 @@ struct DecideInput {
     in_flight: Vec<ChangeView>,
     merged: Vec<String>,
     policy: Policy,
-    key_hex: String,
     actor: String,
     ts: String,
 }
@@ -52,7 +105,6 @@ struct CompleteInput {
     claim: ChangeClaim,
     merge_sha: String,
     port: String,
-    key_hex: String,
     actor: String,
     ts: String,
 }
@@ -63,20 +115,12 @@ struct CompleteOutput {
     decision: DecisionRecord,
 }
 
-fn hex_to_bytes(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
-        return Err("odd hex length".into());
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
-}
-
 fn run_decide(input: &[u8]) -> Result<Vec<u8>, String> {
     let inp: DecideInput =
         serde_json::from_slice(input).map_err(|e| format!("decide input: {}", e))?;
-    let key = hex_to_bytes(&inp.key_hex)?;
+    // H1: the key comes from WASM-static memory, never from the input.
+    // A "key_hex" field in the JSON is ignored by serde (unknown field).
+    let key = authority_key()?;
     let mut gov = Governor::new(inp.policy, key, &inp.actor);
     let mut claim = inp.claim;
     let merged: HashSet<String> = inp.merged.into_iter().collect();
@@ -100,7 +144,8 @@ fn run_decide(input: &[u8]) -> Result<Vec<u8>, String> {
 fn run_complete(input: &[u8]) -> Result<Vec<u8>, String> {
     let inp: CompleteInput =
         serde_json::from_slice(input).map_err(|e| format!("complete input: {}", e))?;
-    let key = hex_to_bytes(&inp.key_hex)?;
+    // H1: same as decide — key from static memory, never the input.
+    let key = authority_key()?;
     let mut gov = Governor::new(Policy::default(), key, &inp.actor);
     // NOTE: the chain parent seal comes from the draft itself; the Worker's
     // persisted chain head must match draft.parent_decision (checked by caller).
@@ -183,6 +228,37 @@ pub extern "C" fn wreck_complete(
     call(input_ptr, input_len, out_ptr, out_cap, run_complete)
 }
 
+/// Install the authority signing key into WASM-static memory (H1).
+/// Call once at worker startup; the key never crosses the JS→WASM
+/// boundary again. Re-installing zeroizes the previous key first.
+/// Returns 0 on success, negative on error.
+///
+/// # Safety
+/// `key_ptr` must point to `key_len` readable bytes (standard WASM ABI
+/// contract: the host copies the key into linear memory first).
+#[no_mangle]
+pub unsafe extern "C" fn wreck_init_key(key_ptr: *const u8, key_len: usize) -> i32 {
+    if key_ptr.is_null() {
+        return -1;
+    }
+    let key = unsafe { slice::from_raw_parts(key_ptr, key_len) };
+    match install_key(key) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Test-only: uninstall the key (with zeroize) so tests can assert the
+/// fail-closed "not installed" path regardless of execution order.
+#[cfg(test)]
+fn uninstall_key_for_tests() {
+    if let Ok(mut guard) = AUTHORITY_KEY.lock() {
+        if let Some(mut old) = guard.take() {
+            zeroize(&mut old);
+        }
+    }
+}
+
 #[cfg(test)]
 mod cap_tests {
     use super::*;
@@ -261,5 +337,104 @@ mod cap_tests {
         assert_eq!(rc, -1);
         let msg = std::str::from_utf8(&out[..512]).unwrap();
         assert!(msg.contains("decide input"), "out: {}", msg);
+    }
+}
+
+#[cfg(test)]
+mod h1_key_tests {
+    use super::*;
+
+    /// Serializes the H1 tests: they share the process-global key static.
+    static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn decide_input_json(extra_key_hex: Option<&str>) -> Vec<u8> {
+        let claim = ChangeClaim::propose(
+            "w-h1",
+            "agent-1",
+            "task-1",
+            Sha::new(&"a".repeat(40)).unwrap(),
+            Sha::new(&"b".repeat(40)).unwrap(),
+            "test intent",
+        )
+        .expect("valid change_id");
+        let mut v = serde_json::json!({
+            "claim": claim,
+            "view": ChangeView::default(),
+            "in_flight": [],
+            "merged": [],
+            "policy": Policy::default(),
+            "actor": "test",
+            "ts": "2026-10-08T00:00:00Z",
+        });
+        if let Some(kh) = extra_key_hex {
+            v.as_object_mut()
+                .unwrap()
+                .insert("key_hex".into(), serde_json::Value::String(kh.into()));
+        }
+        serde_json::to_vec(&v).unwrap()
+    }
+
+    fn install(key: &[u8]) {
+        let rc = unsafe { wreck_init_key(key.as_ptr(), key.len()) };
+        assert_eq!(rc, 0, "wreck_init_key failed");
+    }
+
+    #[test]
+    fn decide_without_installed_key_is_fail_closed() {
+        let _guard = TEST_SERIAL.lock().unwrap();
+        uninstall_key_for_tests();
+        let err = run_decide(&decide_input_json(None)).unwrap_err();
+        assert!(err.contains("not installed"), "err: {}", err);
+        assert!(err.contains("wreck_init_key"), "err: {}", err);
+    }
+
+    #[test]
+    fn init_key_then_decide_works() {
+        let _guard = TEST_SERIAL.lock().unwrap();
+        uninstall_key_for_tests();
+        install(b"test-authority-key-32-bytes!!!!!!!");
+        let out = run_decide(&decide_input_json(None)).expect("decide must work");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["outcome"], "decided"); // evidence gate rejects, but it SEALS
+        assert!(v["decision"]["receipt"]["seal"].is_string());
+    }
+
+    #[test]
+    fn key_hex_in_input_is_ignored() {
+        // H1 core: key material smuggled in the decide input must have no
+        // effect — the installed static key is the only one ever used.
+        let _guard = TEST_SERIAL.lock().unwrap();
+        uninstall_key_for_tests();
+        install(b"installed-key-abc");
+        // garbage key_hex that the OLD code path would have choked on
+        // (odd length → "odd hex length" error before H1)
+        let out = run_decide(&decide_input_json(Some("zz"))).expect("decide must work");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["outcome"], "decided");
+        // and a well-formed-but-wrong key_hex is equally ignored
+        let out2 =
+            run_decide(&decide_input_json(Some(&"ab".repeat(32)))).expect("decide must work");
+        let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+        assert_eq!(v2["outcome"], "decided");
+    }
+
+    #[test]
+    fn init_key_rejects_empty_and_oversized() {
+        let _guard = TEST_SERIAL.lock().unwrap();
+        assert_eq!(unsafe { wreck_init_key(b"".as_ptr(), 0) }, -1);
+        let big = vec![7u8; MAX_KEY_BYTES + 1];
+        assert_eq!(unsafe { wreck_init_key(big.as_ptr(), big.len()) }, -1);
+        assert_eq!(unsafe { wreck_init_key(std::ptr::null(), 10) }, -1);
+    }
+
+    #[test]
+    fn reinit_replaces_key_without_poison() {
+        let _guard = TEST_SERIAL.lock().unwrap();
+        uninstall_key_for_tests();
+        install(b"first-key");
+        install(b"second-key-longer!!");
+        let out = run_decide(&decide_input_json(None)).expect("decide after re-init");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["outcome"], "decided");
     }
 }

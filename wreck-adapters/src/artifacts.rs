@@ -89,19 +89,44 @@ pub struct V4Envelope<T> {
     pub success: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// H4 (cycle-06 audit): hand-written Debug — the repo token is shown once
+/// by the API and must never appear in logs via a stray `{:?}`.
+#[derive(Clone, Deserialize)]
 pub struct CreateRepoResult {
     pub name: String,
     pub remote: String,
     pub token: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl std::fmt::Debug for CreateRepoResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateRepoResult")
+            .field("name", &self.name)
+            .field("remote", &self.remote)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// H4 (cycle-06 audit): hand-written Debug — plaintext is shown once at
+/// mint time; a derived Debug would print it into any debug log.
+#[derive(Clone, Deserialize)]
 pub struct MintTokenResult {
     pub id: String,
     pub plaintext: String,
     pub scope: String,
     pub expires_at: String,
+}
+
+impl std::fmt::Debug for MintTokenResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintTokenResult")
+            .field("id", &self.id)
+            .field("plaintext", &"<redacted>")
+            .field("scope", &self.scope)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -582,5 +607,33 @@ mod tests {
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["name"], "task-1");
         assert_eq!(v["default_branch_only"], true);
+    }
+
+    // H4 regression: secret-bearing structs must never print secrets.
+    #[test]
+    fn create_repo_result_debug_redacts_token() {
+        let r = CreateRepoResult {
+            name: "n".into(),
+            remote: "https://example.invalid/git/n.git".into(),
+            token: "art_v1_SUPERSECRET?expires=123".into(),
+        };
+        let dbg = format!("{:?}", r);
+        assert!(!dbg.contains("SUPERSECRET"), "leaked: {}", dbg);
+        assert!(dbg.contains("<redacted>"), "missing marker: {}", dbg);
+        assert!(dbg.contains('n'), "name lost: {}", dbg);
+    }
+
+    #[test]
+    fn mint_token_result_debug_redacts_plaintext() {
+        let r = MintTokenResult {
+            id: "id-1".into(),
+            plaintext: "art_v1_SUPERSECRET?expires=123".into(),
+            scope: "write".into(),
+            expires_at: "2026-10-09T00:00:00Z".into(),
+        };
+        let dbg = format!("{:?}", r);
+        assert!(!dbg.contains("SUPERSECRET"), "leaked: {}", dbg);
+        assert!(dbg.contains("<redacted>"), "missing marker: {}", dbg);
+        assert!(dbg.contains("id-1"), "id lost: {}", dbg);
     }
 }

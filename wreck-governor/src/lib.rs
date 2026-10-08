@@ -424,7 +424,7 @@ mod tests {
             Sha::new(&"a".repeat(40)).unwrap(),
             Sha::new(&"b".repeat(40)).unwrap(),
             "test",
-        );
+        ).expect("valid change_id");
         c.scope = scope;
         c.claims.push(Claim { id: "C1".into(), statement: "safe".into(), kind: ClaimKind::PreservesApi });
         c.evidence.push(Evidence {
@@ -458,7 +458,7 @@ mod tests {
     fn empty_evidence_is_rejected() {
         let mut g = gov();
         let mut c = ChangeClaim::propose("w-2", "a", "t",
-            Sha::new(&"a".repeat(40)).unwrap(), Sha::new(&"b".repeat(40)).unwrap(), "x");
+            Sha::new(&"a".repeat(40)).unwrap(), Sha::new(&"b".repeat(40)).unwrap(), "x").expect("valid change_id");
         c.scope = vec![ScopeItem::File { path: "src/foo.rs".into() }];
         c.claims.push(Claim { id: "C1".into(), statement: "s".into(), kind: ClaimKind::PreservesApi });
         let v = ChangeView::from_scope("w-2", &c.scope);
@@ -546,7 +546,7 @@ mod attestation_tests {
             Sha::new(&"a".repeat(40)).unwrap(),
             Sha::new(&"b".repeat(40)).unwrap(),
             "innocent refactor",
-        );
+        ).expect("valid change_id");
         c.scope = vec![ScopeItem::File { path: "src/a.rs".into() }];
         c.claims.push(Claim { id: "C1".into(), statement: "s".into(), kind: ClaimKind::PreservesApi });
         c.evidence.push(Evidence {

@@ -2,19 +2,26 @@
  * wreck-worker: the Cloudflare-side event shell for the wreck governor.
  *
  * Flow:  cf.artifacts.repo.pushed -> Queue -> this consumer
- *        -> dedup (KV, keyed on namespace/repo/ref/before/after)
+ *        -> boundary-validate the NESTED official shape (event.js)
+ *        -> baseline exclusion (the governor's own merges are never re-governed)
+ *        -> dedup check (KV)
  *        -> retry-read until `after` SHA is visible via the Artifacts binding
  *        -> build ChangeView (tree diff before/after)
  *        -> wreck_decide (WASM: the Rust governor core — the ONLY decision logic)
  *        -> ACCEPT: merge via the Artifacts merge port, then wreck_complete (seal)
  *           REJECT/BLOCKED: sealed immediately, agent notified with machine reason
+ *        -> dedup key written ONLY after successful processing (H3)
  *        -> receipt appended to the decision chain (D1), dashboard updated (KV/R2)
  *
  * The Worker never decides anything itself. It is IO: events in, git out.
  * All verdict logic lives in wreck-wasm (Rust), one implementation.
+ *
+ * Fail-closed posture (cycle-06 audit): unwired state sources THROW rather
+ * than returning empty (H2); malformed events are poison, never retried (C1);
+ * the authority key is installed once into WASM-static memory and never
+ * crosses the JS→WASM boundary again (H1).
  */
 
-import wasmBytes from "./wreck_wasm.wasm";
 import {
   CapExceeded,
   EVENT_CAP,
@@ -22,12 +29,16 @@ import {
   checkCap,
   utf8Len,
 } from "./caps.js";
+import { InvalidEvent, dedupKey, parseEvent } from "./event.js";
 
 let wasm = null;
 let memory = null;
 
 async function getWasm() {
   if (wasm) return wasm;
+  // Lazy: the .wasm module is produced by `cargo build -p wreck-wasm`;
+  // importing it statically would break node-based unit tests.
+  const { default: wasmBytes } = await import("./wreck_wasm.wasm");
   const mod = await WebAssembly.instantiate(wasmBytes, {});
   wasm = mod.instance.exports;
   memory = wasm.memory;
@@ -43,8 +54,25 @@ function callWasm(fn, inputObj, outCap = 65536) {
   throw new Error("scaffold: wire the wasm allocator before deploy");
 }
 
-function dedupKey(e) {
-  return `wreck:seen:${e.namespace}:${e.repo}:${e.ref}:${e.before}:${e.after}`;
+/**
+ * H1: install the authority signing key ONCE into WASM-static memory via
+ * wreck_init_key. The key never crosses the JS→WASM boundary again —
+ * decide/complete inputs carry no key material. Requires the M6
+ * per-call allocator (wreck_alloc/wreck_free).
+ */
+async function initAuthorityKey(w, env) {
+  const raw = env.GOVERNOR_KEY; // Uint8Array secret bytes; never logged
+  if (!w.wreck_alloc || !w.wreck_init_key) {
+    throw new Error("scaffold: wreck_alloc/wreck_init_key not exported yet (see M6)");
+  }
+  const ptr = w.wreck_alloc(raw.length);
+  try {
+    new Uint8Array(w.memory.buffer, ptr, raw.length).set(raw);
+    const rc = w.wreck_init_key(ptr, raw.length);
+    if (rc !== 0) throw new Error(`wreck_init_key failed: ${rc}`);
+  } finally {
+    if (w.wreck_free) w.wreck_free(ptr, raw.length);
+  }
 }
 
 export default {
@@ -54,23 +82,11 @@ export default {
    */
   async queue(batch, env) {
     const w = await getWasm();
+    // H1: install the authority key once per isolate startup. Re-installing
+    // zeroizes the previous key inside WASM before replacing it.
+    await initAuthorityKey(w, env);
     for (const msg of batch.messages) {
-      try {
-        // cap the queue message body before touching it: 16 KiB, reject-never-truncate
-        checkCap(utf8Len(JSON.stringify(msg.body)), EVENT_CAP, "queue message body");
-        await handlePush(msg.body, env, w);
-        msg.ack();
-      } catch (err) {
-        if (err instanceof CapExceeded) {
-          // poison message: deterministically oversized, retry can never succeed
-          console.error("wreck: cap exceeded, dropping poison message", err.message);
-          msg.ack();
-        } else {
-          // at-least-once: retry later; dedup key makes reprocessing safe
-          console.error("wreck: handlePush failed, will retry", err);
-          msg.retry();
-        }
-      }
+      await handleMessage(msg, env, w);
     }
   },
 
@@ -84,81 +100,114 @@ export default {
   },
 };
 
-async function handlePush(event, env, w) {
-  // cap the push-event payload before touching it: 16 KiB, reject-never-truncate
-  checkCap(utf8Len(JSON.stringify(event)), EVENT_CAP, "push event payload");
-  // event shape: { namespace, repo, ref, before, after, commits[] }
-  // baseline repo pushes are the governor's own merges — never re-govern.
-  if (event.repo === "baseline") return;
+/** One queue message: poison (CapExceeded/InvalidEvent) is acked, never retried. */
+async function handleMessage(msg, env, w) {
+  try {
+    // cap the queue message body before touching it: 16 KiB, reject-never-truncate
+    checkCap(utf8Len(JSON.stringify(msg.body)), EVENT_CAP, "queue message body");
+    await handlePush(msg.body, env, w);
+    msg.ack();
+  } catch (err) {
+    if (err instanceof CapExceeded || err instanceof InvalidEvent) {
+      // poison message: retry can never succeed
+      console.error("wreck: poison message, acking", err.message);
+      msg.ack();
+    } else {
+      // at-least-once: retry later; dedup key makes reprocessing safe
+      console.error("wreck: handlePush failed, will retry", err);
+      msg.retry();
+    }
+  }
+}
 
-  const key = dedupKey(event);
+async function handlePush(event, env, w, deps = {}) {
+  const {
+    decide = (o) => callWasm("wreck_decide", o),
+    complete = (o) => callWasm("wreck_complete", o),
+    merge = mergePort,
+    record = recordDecision,
+    notify = notifyAgent,
+    // state sources are injectable so the decided path is unit-testable;
+    // in production these are the fail-closed H2 stubs until wired.
+    inFlight = (e, n) => inFlightViews(e, n),
+    merged = (e, n) => mergedIds(e, n),
+    policy = (e) => activePolicy(e),
+  } = deps;
+
+  // C1: validate the nested official shape at the boundary. Throws
+  // InvalidEvent (poison) on any deviation — never process a half-shape.
+  const ev = parseEvent(event);
+
+  // baseline repo pushes are the governor's own merges — never re-govern.
+  if (ev.repoName === "baseline") return;
+
+  const key = dedupKey(ev);
   if (await env.GOVERNOR_KV.get(key)) return; // already processed
-  await env.GOVERNOR_KV.put(key, "1", { expirationTtl: 86400 });
 
   // retry-read: the event can arrive before the commit is readable
-  const after = await waitVisible(env, event, 5);
+  const after = await waitVisible(env, ev, 5);
 
   // build the mechanical view: tree diff before/after
-  const view = await buildView(env, event, after);
+  const view = await buildView(env, ev, after);
 
   // the claim: agents submit claims with their push (commit trailer
   // `Wreck-Claim: <json>`); without one the governor still runs on the
   // measured diff, with zero declared semantics.
-  const claim = claimFromCommit(event, after);
+  const claim = claimFromCommit(ev, after);
 
   // ---- the decision: 100% Rust, via WASM ----
-  const decideOut = callWasm("wreck_decide", {
+  // H1: no key_hex — the authority key lives in WASM-static memory.
+  const decideOut = decide({
     claim,
     view,
-    in_flight: await inFlightViews(env, event.namespace),
-    merged: await mergedIds(env, event.namespace),
-    policy: await activePolicy(env),
-    key_hex: env.GOVERNOR_KEY_HEX,
+    in_flight: await inFlight(env, ev.namespace),
+    merged: await merged(env, ev.namespace),
+    policy: await policy(env),
     actor: "wreck-governor",
     ts: new Date().toISOString(),
   });
 
   if (decideOut.outcome === "decided") {
-    await recordDecision(env, decideOut.decision);
-    await notifyAgent(env, claim, decideOut.decision);
-    return;
+    await record(env, decideOut.decision);
+    await notify(env, claim, decideOut.decision);
+  } else {
+    // ACCEPT pending: merge, then seal.
+    const mergeSha = await merge(env, ev, decideOut.draft);
+    const completeOut = complete({
+      draft: decideOut.draft,
+      claim: decideOut.claim,
+      merge_sha: mergeSha,
+      port: "artifacts",
+      actor: "wreck-governor",
+      ts: new Date().toISOString(),
+    });
+    await record(env, completeOut.decision);
+    await notify(env, claim, completeOut.decision);
   }
 
-  // ACCEPT pending: merge, then seal.
-  // TODO(adapter-spec): the Artifacts merge mechanism lands here —
-  // currently documented as "git push over HTTPS with the governor's
-  // repo-scoped token"; the adapter researcher confirms the exact call.
-  const mergeSha = await mergePort(env, event, decideOut.draft);
-
-  const completeOut = callWasm("wreck_complete", {
-    draft: decideOut.draft,
-    claim: decideOut.claim,
-    merge_sha: mergeSha,
-    port: "artifacts",
-    key_hex: env.GOVERNOR_KEY_HEX,
-    actor: "wreck-governor",
-    ts: new Date().toISOString(),
-  });
-  await recordDecision(env, completeOut.decision);
-  await notifyAgent(env, claim, completeOut.decision);
+  // H3: the dedup key is written ONLY after successful processing. A crash
+  // before this line redelivers the event (safe: reprocessing is
+  // idempotent); a crash after is covered by the key. Writing it earlier
+  // would silently drop the change on crash.
+  await env.GOVERNOR_KV.put(key, "1", { expirationTtl: 86400 });
 }
 
 /** Poll the binding until `after` is readable (usually immediate). */
-async function waitVisible(env, event, tries) {
-  const repo = env.ARTIFACTS.get(event.repo); // throws until status === "ready"
+async function waitVisible(env, ev, tries) {
+  const repo = env.ARTIFACTS.get(ev.repoName); // throws until status === "ready"
   for (let i = 0; i < tries; i++) {
-    const c = await repo.readCommit(event.after); // metadata | null
+    const c = await repo.readCommit(ev.after); // metadata | null
     if (c) return c;
     await new Promise((r) => setTimeout(r, 500 * (i + 1)));
   }
-  throw new Error(`commit ${event.after} never became visible`);
+  throw new Error(`commit ${ev.after} never became visible`);
 }
 
-async function buildView(env, event, after) {
+async function buildView(env, ev, after) {
   // No server-side diff: walk both trees, compare blob hashes, diff locally.
-  const repo = env.ARTIFACTS.get(event.repo);
-  const oldBlobs = await treeBlobs(repo, event.before);
-  const newBlobs = await treeBlobs(repo, event.after);
+  const repo = env.ARTIFACTS.get(ev.repoName);
+  const oldBlobs = await treeBlobs(repo, ev.before);
+  const newBlobs = await treeBlobs(repo, ev.after);
   const files = [];
   const paths = [...new Set([...oldBlobs.keys(), ...newBlobs.keys()])].sort();
   for (const path of paths) {
@@ -169,7 +218,7 @@ async function buildView(env, event, after) {
     const newText = nh ? await (await repo.readBlob(nh)).text() : "";
     files.push({ path, ...diffRanges(oldText, newText) });
   }
-  return { change_id: event.repo, files, symbols: [], invariants: [], contracts: [], dependencies: [] };
+  return { change_id: ev.repoName, files, symbols: [], invariants: [], contracts: [], dependencies: [] };
 }
 
 /** Recursive tree walk via readTree (immediate children only). */
@@ -190,7 +239,7 @@ function diffRanges(oldText, newText) {
   return { added: [], removed: [], _todo: "line ranges" };
 }
 
-function claimFromCommit(event, after) {
+function claimFromCommit(ev, after) {
   // The claim rides the push: parse the `Wreck-Claim:` trailer from the
   // commit message (present in the push event's commits[] — zero extra reads).
   // The event's `after` SHA stays authoritative for the head; the trailer
@@ -202,11 +251,11 @@ function claimFromCommit(event, after) {
   // cap the claim trailer before parsing: 16 KiB, reject-never-truncate
   if (line) checkCap(utf8Len(line), EVENT_CAP, "Wreck-Claim trailer");
   const base = {
-    change_id: event.repo,
+    change_id: ev.repoName,
     agent_id: (after.author && after.author.name) || "unknown",
     task_id: "unknown",
-    base: event.before,
-    head: event.after,
+    base: ev.before,
+    head: ev.after,
     intent: msg.split("\n")[0] || "",
     scope: [],
     claims: [],
@@ -217,28 +266,32 @@ function claimFromCommit(event, after) {
   if (!line) return base;
   try {
     const claimed = JSON.parse(line.slice("Wreck-Claim:".length).trim());
-    return { ...base, ...claimed, base: event.before, head: event.after, status: "PROPOSED" };
+    return { ...base, ...claimed, base: ev.before, head: ev.after, status: "PROPOSED" };
   } catch {
     return base;
   }
 }
 
 async function inFlightViews(env, namespace) {
-  // TODO: KV index of proposed-but-undecided changes per namespace
-  return [];
+  // H2 (cycle-06 audit): fail-closed default-deny. Until the KV in-flight
+  // index is wired, deciding with an empty list would ACCEPT every
+  // well-formed change. Throwing retries the event instead.
+  throw new Error("wreck: inFlightViews unwired — refusing to decide without in-flight state");
 }
 
 async function mergedIds(env, namespace) {
-  // TODO: D1 query of merged change ids
-  return [];
+  // H2: same as inFlightViews — an empty merged set breaks the dependency
+  // gate, so this must throw until the D1 query is wired.
+  throw new Error("wreck: mergedIds unwired — refusing to decide without merged state");
 }
 
 async function activePolicy(env) {
-  // TODO: CANON rules from D1 -> { rules: [{id, forbidden_contract, reason}] }
-  return { rules: [] };
+  // H2: same — an empty policy ACCEPTs everything. Throw until the CANON
+  // rules are loaded from D1.
+  throw new Error("wreck: activePolicy unwired — refusing to decide without policy");
 }
 
-async function mergePort(env, event, draft) {
+async function mergePort(env, ev, draft) {
   // Single-writer merge onto baseline main.
   // Production shape: a Durable Object lease around this section —
   // never parallel pushes to the shared ref (failed pushes grow
@@ -266,3 +319,7 @@ async function recordDecision(env, decision) {
 async function notifyAgent(env, claim, decision) {
   // TODO: machine-readable verdict back to the agent (queue / webhook / PR comment)
 }
+
+// Named exports for unit tests (node --test). The default export above is
+// the Worker entrypoint.
+export { handlePush, handleMessage, claimFromCommit, inFlightViews, mergedIds, activePolicy, initAuthorityKey };
