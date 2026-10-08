@@ -698,6 +698,8 @@ dependencies = [
  "log",
  "native-tls",
  "once_cell",
+ "serde",
+ "serde_json",
  "url",
 ]
 
@@ -772,7 +774,9 @@ dependencies = [
 name = "wreck-adapters"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
+ "ureq",
  "wreck-governor",
  "wreck-graph",
  "wreck-protocol",

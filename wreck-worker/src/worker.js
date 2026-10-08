@@ -126,22 +126,49 @@ async function handlePush(event, env, w) {
 
 /** Poll the binding until `after` is readable (usually immediate). */
 async function waitVisible(env, event, tries) {
+  const repo = env.ARTIFACTS.get(event.repo); // throws until status === "ready"
   for (let i = 0; i < tries; i++) {
-    try {
-      // TODO(adapter-spec): exact binding method name (log/readCommit)
-      const c = await env.ARTIFACTS.readCommit(event.namespace, event.repo, event.after);
-      if (c) return c;
-    } catch {}
+    const c = await repo.readCommit(event.after); // metadata | null
+    if (c) return c;
     await new Promise((r) => setTimeout(r, 500 * (i + 1)));
   }
   throw new Error(`commit ${event.after} never became visible`);
 }
 
 async function buildView(env, event, after) {
-  // TODO(adapter-spec): tree-walk before/after via the binding, parse -U0
-  // hunks into added/removed ranges. The Rust LocalGit::diff_view is the
-  // reference implementation; this is its binding-backed twin.
-  throw new Error("scaffold: buildView not yet wired to the Artifacts binding");
+  // No server-side diff: walk both trees, compare blob hashes, diff locally.
+  const repo = env.ARTIFACTS.get(event.repo);
+  const oldBlobs = await treeBlobs(repo, event.before);
+  const newBlobs = await treeBlobs(repo, event.after);
+  const files = [];
+  const paths = [...new Set([...oldBlobs.keys(), ...newBlobs.keys()])].sort();
+  for (const path of paths) {
+    const oh = oldBlobs.get(path);
+    const nh = newBlobs.get(path);
+    if (oh === nh) continue;
+    const oldText = oh ? await (await repo.readBlob(oh)).text() : "";
+    const newText = nh ? await (await repo.readBlob(nh)).text() : "";
+    files.push({ path, ...diffRanges(oldText, newText) });
+  }
+  return { change_id: event.repo, files, symbols: [], invariants: [], contracts: [], dependencies: [] };
+}
+
+/** Recursive tree walk via readTree (immediate children only). */
+async function treeBlobs(repo, hash, prefix = "", out = new Map()) {
+  const entries = (await repo.readTree(hash)) || [];
+  for (const e of entries) {
+    const path = prefix ? `${prefix}/${e.path}` : e.path;
+    if (e.type === "tree") await treeBlobs(repo, e.hash, path, out);
+    else out.set(path, e.hash);
+  }
+  return out;
+}
+
+/** Minimal -U0 hunk parser (mirrors the Rust parse_unified_zero). */
+function diffRanges(oldText, newText) {
+  // TODO: implement or ship a tiny LCS; the Rust LocalGit::diff_view is the
+  // reference. For the scaffold, call out to a diff helper.
+  return { added: [], removed: [], _todo: "line ranges" };
 }
 
 function claimFromCommit(event, after) {
@@ -165,8 +192,23 @@ async function activePolicy(env) {
 }
 
 async function mergePort(env, event, draft) {
-  // TODO(adapter-spec): single-writer merge onto baseline main.
-  // In production this is a Durable Object lease around the merge.
+  // Single-writer merge onto baseline main.
+  // Production shape: a Durable Object lease around this section —
+  // never parallel pushes to the shared ref (failed pushes grow
+  // quadratically with contending agents).
+  //
+  // Mechanism (no write path in the binding or REST — all mutations are
+  // git pushes): the Worker shells nothing, so the merge is a git
+  // smart-HTTP push sequence via fetch() against the repo's git remote,
+  // authenticated with the governor's repo-scoped token:
+  //   remote = `https://${accountId}.artifacts.cloudflare.net/git/${namespace}/baseline.git`
+  //   header = `Authorization: Bearer ${governorTokenSecret}`
+  // (token secret = art_v1_... part before `?expires=`).
+  // The minimal honest v1: fetch baseline tip, create the merge commit
+  // client-side (git merge --no-ff semantics over the two trees), push.
+  // TODO(live-verify): prove the smart-HTTP push sequence against a real
+  // Artifacts repo once Workers Paid lands; fall back to a merge-service
+  // container if the Worker sandbox blocks it.
   throw new Error("scaffold: mergePort not yet implemented");
 }
 
