@@ -4,9 +4,9 @@
 pub struct Row {
     pub agent: String,
     pub change_id: String,
-    pub verdict: String,      // ACCEPT | REJECT | BLOCKED
-    pub badge_class: String,  // accept | reject | blocked
-    pub detail: String,        // rule + reason
+    pub verdict: String,     // ACCEPT | REJECT | BLOCKED
+    pub badge_class: String, // accept | reject | blocked
+    pub detail: String,      // rule + reason
     pub conflicts: Vec<String>,
     pub seal: String,
     pub status: String,
@@ -53,7 +53,11 @@ pub fn render(task: &str, rows: &[Row], stats: &Stats, log: &str) -> String {
     let mut ay = top;
     for f in files.iter().chain(invs.iter()) {
         art_y.insert(f.clone(), ay + 16.0);
-        let color = if f.starts_with("AUTH") || f.contains("auth.error") { "#f0a" } else { "#4af" };
+        let color = if f.starts_with("AUTH") || f.contains("auth.error") {
+            "#f0a"
+        } else {
+            "#4af"
+        };
         svg.push_str(&format!(
             "<rect x=\"420\" y=\"{}\" width=\"300\" height=\"32\" rx=\"6\" fill=\"#16161e\" stroke=\"{}\"/>",
             ay, color
@@ -87,8 +91,16 @@ pub fn render(task: &str, rows: &[Row], stats: &Stats, log: &str) -> String {
         ));
         for f in r.files.iter().chain(r.invariants.iter()) {
             if let Some(&ty) = art_y.get(f) {
-                let dashed = if r.badge_class == "reject" { " stroke-dasharray=\"4,3\"" } else { "" };
-                let ecol = if r.badge_class == "reject" { "#e74c3c" } else { "#555" };
+                let dashed = if r.badge_class == "reject" {
+                    " stroke-dasharray=\"4,3\""
+                } else {
+                    ""
+                };
+                let ecol = if r.badge_class == "reject" {
+                    "#e74c3c"
+                } else {
+                    "#555"
+                };
                 svg.push_str(&format!(
                     "<line x1=\"240\" y1=\"{}\" x2=\"420\" y2=\"{}\" stroke=\"{}\" stroke-width=\"1.5\"{}/>",
                     cy, ty, ecol, dashed
@@ -103,7 +115,11 @@ pub fn render(task: &str, rows: &[Row], stats: &Stats, log: &str) -> String {
         let conf = if r.conflicts.is_empty() {
             "<span class=\"dim\">none</span>".to_string()
         } else {
-            r.conflicts.iter().map(|c| format!("<div class=\"conf\">{}</div>", esc(c))).collect::<Vec<_>>().join("")
+            r.conflicts
+                .iter()
+                .map(|c| format!("<div class=\"conf\">{}</div>", esc(c)))
+                .collect::<Vec<_>>()
+                .join("")
         };
         table.push_str(&format!(
             "<tr><td class=\"mono\">{}</td><td><span class=\"badge {}\">{}</span></td>\
@@ -154,11 +170,20 @@ pre {{ background:#101018; padding:16px; border-radius:8px; font-size:12px; over
 <div class="sub">Don't merge agents. Merge proven state transitions.</div>
 </body></html>"#,
         esc(task),
-        stats.agents, stats.changes, stats.accepted, stats.rejected, stats.blocked, stats.sealed,
-        svg, table, esc(log)
+        stats.agents,
+        stats.changes,
+        stats.accepted,
+        stats.rejected,
+        stats.blocked,
+        stats.sealed,
+        svg,
+        table,
+        esc(log)
     )
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }

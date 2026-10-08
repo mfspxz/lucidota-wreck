@@ -31,14 +31,20 @@ fn baseline(nfiles: usize, lines_per: usize) -> Vec<(String, String)> {
 }
 
 fn main() {
-    let k: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(50);
+    let k: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
     let root = PathBuf::from("/tmp/wreck-scale");
     let _ = std::fs::remove_dir_all(&root);
     let git = LocalGit::new(&root);
 
     // 10 files x 200 lines: plenty of disjoint room
     let files = baseline(10, 200);
-    let file_refs: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+    let file_refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_str()))
+        .collect();
     let base = git.init_baseline(&file_refs).expect("init");
     let base_text: HashMap<String, Vec<String>> = files
         .into_iter()
@@ -46,7 +52,11 @@ fn main() {
         .collect();
 
     let canon = wreck_canon::demo_canon();
-    let mut gov = Governor::new(canon.to_policy(), b"scale-authority-key-32bytes-padded".to_vec(), "governor");
+    let mut gov = Governor::new(
+        canon.to_policy(),
+        b"scale-authority-key-32bytes-padded".to_vec(),
+        "governor",
+    );
 
     // Plant the collision plan (deterministic):
     // - agents 0..k-8: disjoint 10-line regions (compatible)
@@ -82,7 +92,9 @@ fn main() {
                 "// rewritten error semantics\n".to_string(),
                 vec![
                     ScopeItem::File { path: path.clone() },
-                    ScopeItem::Contract { id: "auth.error-semantics".into() },
+                    ScopeItem::Contract {
+                        id: "auth.error-semantics".into(),
+                    },
                 ],
                 vec![],
             ),
@@ -96,12 +108,18 @@ fn main() {
                 out.extend(with);
                 out.extend(lines[end..].to_vec());
                 let content = out.join("\n") + "\n";
-                let inv = if kind == "collide-sem" || i == 1 { vec!["AUTH-03"] } else { vec![] };
+                let inv = if kind == "collide-sem" || i == 1 {
+                    vec!["AUTH-03"]
+                } else {
+                    vec![]
+                };
                 (
                     content,
                     vec![
                         ScopeItem::File { path: path.clone() },
-                        ScopeItem::Symbol { name: format!("sym_{}", i) },
+                        ScopeItem::Symbol {
+                            name: format!("sym_{}", i),
+                        },
                     ],
                     inv,
                 )
@@ -111,14 +129,30 @@ fn main() {
             .commit_change(&fork, &[(&path, &new_content)], &format!("{}: work", id))
             .expect("commit");
 
-        let mut c = ChangeClaim::propose(&id, &format!("agent-{}", i), "task-scale", base.clone(), head.clone(), "scale work").expect("valid change_id");
+        let mut c = ChangeClaim::propose(
+            &id,
+            &format!("agent-{}", i),
+            "task-scale",
+            base.clone(),
+            head.clone(),
+            "scale work",
+        )
+        .expect("valid change_id");
         c.scope = scope.clone();
-        c.claims.push(Claim { id: "C1".into(), statement: "safe".into(), kind: ClaimKind::PreservesApi });
-        c.evidence.push(Evidence {
-            id: "C1-E1".into(), kind: EvidenceKind::Test,
-            reference: "C1: test scale".into(), digest: "sha256:x".into(),
+        c.claims.push(Claim {
+            id: "C1".into(),
+            statement: "safe".into(),
+            kind: ClaimKind::PreservesApi,
         });
-        let mut v = git.diff_view(&id, &scope, &fork, &base, &head).expect("diff");
+        c.evidence.push(Evidence {
+            id: "C1-E1".into(),
+            kind: EvidenceKind::Test,
+            reference: "C1: test scale".into(),
+            digest: "sha256:x".into(),
+        });
+        let mut v = git
+            .diff_view(&id, &scope, &fork, &base, &head)
+            .expect("diff");
         v.invariants = invariants.into_iter().map(|s| s.to_string()).collect();
         forks.insert(id.clone(), fork);
         claims.push(c);
@@ -127,7 +161,10 @@ fn main() {
     let setup_ms = t0.elapsed().as_millis();
 
     // govern in arrival order
-    let port = LocalMergePort { baseline: git.baseline_path(), forks };
+    let port = LocalMergePort {
+        baseline: git.baseline_path(),
+        forks,
+    };
     let mut merged: HashSet<String> = HashSet::new();
     let mut seen: Vec<ChangeView> = vec![];
     let (mut acc, mut rej) = (0, 0);
@@ -150,7 +187,11 @@ fn main() {
 
     println!("wreck-scale: {} agents", k);
     println!("  setup (fork+commit): {} ms", setup_ms);
-    println!("  governed: {} ms  ({:.1} decisions/sec)", gov_ms, k as f64 / (gov_ms.max(1) as f64 / 1000.0));
+    println!(
+        "  governed: {} ms  ({:.1} decisions/sec)",
+        gov_ms,
+        k as f64 / (gov_ms.max(1) as f64 / 1000.0)
+    );
     println!("  accepted: {}  rejected: {}", acc, rej);
     println!("  decisions sealed: {}", gov.decisions_sealed());
     println!("  human merges: 0");

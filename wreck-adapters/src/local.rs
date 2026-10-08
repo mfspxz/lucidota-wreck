@@ -72,7 +72,9 @@ pub struct LocalGit {
 
 impl LocalGit {
     pub fn new(root: &Path) -> Self {
-        LocalGit { root: root.to_path_buf() }
+        LocalGit {
+            root: root.to_path_buf(),
+        }
     }
 
     pub fn baseline_path(&self) -> PathBuf {
@@ -112,11 +114,19 @@ impl LocalGit {
         }
         let b = self.baseline_path();
         let out = Command::new("git")
-            .args(["clone", "--quiet", b.to_str().unwrap(), dest.to_str().unwrap()])
+            .args([
+                "clone",
+                "--quiet",
+                b.to_str().unwrap(),
+                dest.to_str().unwrap(),
+            ])
             .output()
             .map_err(|e| e.to_string())?;
         if !out.status.success() {
-            return Err(format!("clone failed: {}", String::from_utf8_lossy(&out.stderr)));
+            return Err(format!(
+                "clone failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
         }
         Ok(dest)
     }
@@ -157,11 +167,18 @@ impl LocalGit {
         // with measured ranges, keep declared-only entries as-is.
         let mut measured: HashMap<String, FileChange> = HashMap::new();
         for path in names.lines().filter(|l| !l.is_empty()) {
-            let diff = git(fork, &["diff", "-U0", base.as_str(), head.as_str(), "--", path])?;
+            let diff = git(
+                fork,
+                &["diff", "-U0", base.as_str(), head.as_str(), "--", path],
+            )?;
             let (added, removed) = parse_unified_zero(&diff);
             measured.insert(
                 path.to_string(),
-                FileChange { path: path.to_string(), added, removed },
+                FileChange {
+                    path: path.to_string(),
+                    added,
+                    removed,
+                },
             );
         }
         for f in view.files.iter_mut() {
@@ -191,8 +208,8 @@ impl LocalGit {
             if f.added.is_empty() || !f.path.ends_with(".rs") {
                 continue;
             }
-            let content = git(fork, &["show", &format!("{}:{}", head.as_str(), f.path)])
-                .unwrap_or_default();
+            let content =
+                git(fork, &["show", &format!("{}:{}", head.as_str(), f.path)]).unwrap_or_default();
             if content.is_empty() {
                 continue;
             }
@@ -222,10 +239,16 @@ impl wreck_governor::MergePort for LocalMergePort {
 
     fn merge(&self, change: &ChangeClaim) -> Result<Sha, String> {
         let fork = self.forks.get(&change.change_id).ok_or_else(|| {
-            format!("wreck-adapters: no fork registered for {}", change.change_id)
+            format!(
+                "wreck-adapters: no fork registered for {}",
+                change.change_id
+            )
         })?;
         // fetch the fork's head into the baseline, then merge --no-ff
-        git(&self.baseline, &["fetch", fork.to_str().unwrap(), change.head.as_str()])?;
+        git(
+            &self.baseline,
+            &["fetch", fork.to_str().unwrap(), change.head.as_str()],
+        )?;
         git(
             &self.baseline,
             &[
@@ -254,19 +277,32 @@ mod tests {
     fn diff_view_measures_line_ranges() {
         let root = tmp();
         let g = LocalGit::new(&root);
-        let base = g.init_baseline(&[("src/auth.rs", "line1\nline2\nline3\nline4\nline5\n")]).unwrap();
+        let base = g
+            .init_baseline(&[("src/auth.rs", "line1\nline2\nline3\nline4\nline5\n")])
+            .unwrap();
         let fork = g.fork("a").unwrap();
         let head = g
-            .commit_change(&fork, &[("src/auth.rs", "line1\nLINE2\nline3\nline4\nline5\nline6\n")], "change a")
+            .commit_change(
+                &fork,
+                &[("src/auth.rs", "line1\nLINE2\nline3\nline4\nline5\nline6\n")],
+                "change a",
+            )
             .unwrap();
-        let scope = vec![ScopeItem::File { path: "src/auth.rs".into() }];
-        let v = g.diff_view("change-a", &scope, &fork, &base, &head).unwrap();
+        let scope = vec![ScopeItem::File {
+            path: "src/auth.rs".into(),
+        }];
+        let v = g
+            .diff_view("change-a", &scope, &fork, &base, &head)
+            .unwrap();
         assert_eq!(v.files.len(), 1);
         // line 2 replaced -> removed (2,2); line 6 added -> added (6,6); replacement shows as (2,2) added too
         let f = &v.files[0];
         assert!(f.removed.contains(&(2, 2)), "removed: {:?}", f.removed);
-        assert!(f.added.iter().any(|(s, e)| *s <= 6 && *e >= 6) || f.added.contains(&(2, 2)),
-            "added: {:?}", f.added);
+        assert!(
+            f.added.iter().any(|(s, e)| *s <= 6 && *e >= 6) || f.added.contains(&(2, 2)),
+            "added: {:?}",
+            f.added
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

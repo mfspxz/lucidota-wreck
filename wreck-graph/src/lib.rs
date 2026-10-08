@@ -9,8 +9,8 @@
 //! Classification is a deterministic approximation with explicit evidence —
 //! never an LLM oracle.
 
-use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use wreck_protocol::{ConflictKind, ConflictRef, ScopeItem};
 
 /// One file's changed line ranges, in the *new* (head) revision numbering
@@ -39,7 +39,8 @@ impl FileChange {
 }
 
 fn ranges_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
-    a.iter().any(|(s1, e1)| b.iter().any(|(s2, e2)| s1 <= e2 && s2 <= e1))
+    a.iter()
+        .any(|(s1, e1)| b.iter().any(|(s2, e2)| s1 <= e2 && s2 <= e1))
 }
 
 /// The adapter-facing view of one change: what it touches, what it claims,
@@ -57,12 +58,19 @@ pub struct ChangeView {
 impl ChangeView {
     /// Derive the mechanical parts from a protocol ChangeClaim's scope.
     pub fn from_scope(change_id: &str, scope: &[ScopeItem]) -> Self {
-        let mut v = ChangeView { change_id: change_id.to_string(), ..Default::default() };
+        let mut v = ChangeView {
+            change_id: change_id.to_string(),
+            ..Default::default()
+        };
         for s in scope {
             match s {
                 ScopeItem::File { path } => {
                     if !v.files.iter().any(|f| f.path == *path) {
-                        v.files.push(FileChange { path: path.clone(), added: vec![], removed: vec![] });
+                        v.files.push(FileChange {
+                            path: path.clone(),
+                            added: vec![],
+                            removed: vec![],
+                        });
                     }
                 }
                 ScopeItem::Symbol { name } => v.symbols.push(name.clone()),
@@ -156,9 +164,9 @@ pub fn classify(
         if b.symbols.contains(sym) {
             // Only a semantic conflict if there is no textual conflict on it
             // already (avoid double counting the same underlying collision).
-            let already_textual = out.iter().any(|c| {
-                c.kind == ConflictKind::Textual && c.with_change == b.change_id
-            });
+            let already_textual = out
+                .iter()
+                .any(|c| c.kind == ConflictKind::Textual && c.with_change == b.change_id);
             if !already_textual {
                 out.push(ConflictRef {
                     with_change: b.change_id.clone(),
@@ -221,8 +229,11 @@ pub fn build_candidate(
         }
         // dedup identical (kind, with_change, detail)
         conflicts.sort_by(|a, b| {
-            (&a.kind_str(), &a.with_change, &a.detail)
-                .cmp(&(&b.kind_str(), &b.with_change, &b.detail))
+            (&a.kind_str(), &a.with_change, &a.detail).cmp(&(
+                &b.kind_str(),
+                &b.with_change,
+                &b.detail,
+            ))
         });
         conflicts.dedup_by(|a, b| {
             a.kind_str() == b.kind_str() && a.with_change == b.with_change && a.detail == b.detail
@@ -269,16 +280,30 @@ impl ChangeIndex {
         let mut idx = ChangeIndex::default();
         for v in views {
             for f in &v.files {
-                idx.by_file.entry(f.path.clone()).or_default().push(v.change_id.clone());
+                idx.by_file
+                    .entry(f.path.clone())
+                    .or_default()
+                    .push(v.change_id.clone());
             }
             for s in &v.symbols {
-                idx.by_symbol.entry(s.clone()).or_default().push(v.change_id.clone());
+                idx.by_symbol
+                    .entry(s.clone())
+                    .or_default()
+                    .push(v.change_id.clone());
             }
             for i in &v.invariants {
-                idx.by_invariant.entry(i.clone()).or_default().push(v.change_id.clone());
+                idx.by_invariant
+                    .entry(i.clone())
+                    .or_default()
+                    .push(v.change_id.clone());
             }
         }
-        for v in idx.by_file.values_mut().chain(idx.by_symbol.values_mut()).chain(idx.by_invariant.values_mut()) {
+        for v in idx
+            .by_file
+            .values_mut()
+            .chain(idx.by_symbol.values_mut())
+            .chain(idx.by_invariant.values_mut())
+        {
             v.sort();
             v.dedup();
         }
@@ -291,40 +316,49 @@ mod tests {
     use super::*;
 
     fn fc(path: &str, added: Vec<(u32, u32)>, removed: Vec<(u32, u32)>) -> FileChange {
-        FileChange { path: path.into(), added, removed }
+        FileChange {
+            path: path.into(),
+            added,
+            removed,
+        }
     }
 
     /// The nasty demo: five agents on the auth subsystem.
     fn demo_views() -> Vec<ChangeView> {
         vec![
-            ChangeView { // A: token validation, lines 10-40
+            ChangeView {
+                // A: token validation, lines 10-40
                 change_id: "change-a".into(),
                 files: vec![fc("src/auth.rs", vec![(10, 40)], vec![])],
                 symbols: vec!["validate_token".into()],
                 invariants: vec!["AUTH-03".into()],
                 ..Default::default()
             },
-            ChangeView { // B: token expiration, lines 50-80 — same file, disjoint
+            ChangeView {
+                // B: token expiration, lines 50-80 — same file, disjoint
                 change_id: "change-b".into(),
                 files: vec![fc("src/auth.rs", vec![(50, 80)], vec![])],
                 symbols: vec!["token_expiry".into()],
                 invariants: vec!["AUTH-07".into()],
                 ..Default::default()
             },
-            ChangeView { // C: retry behavior, lines 30-45 — overlaps A textually
+            ChangeView {
+                // C: retry behavior, lines 30-45 — overlaps A textually
                 change_id: "change-c".into(),
                 files: vec![fc("src/auth.rs", vec![(30, 45)], vec![])],
                 symbols: vec!["retry_policy".into()],
                 invariants: vec!["AUTH-03".into()], // same invariant as A: semantic too
                 ..Default::default()
             },
-            ChangeView { // D: error handling, touches forbidden contract
+            ChangeView {
+                // D: error handling, touches forbidden contract
                 change_id: "change-d".into(),
                 files: vec![fc("src/auth_err.rs", vec![(1, 20)], vec![])],
                 contracts: vec!["auth.error-semantics".into()],
                 ..Default::default()
             },
-            ChangeView { // E: tests, depends on A
+            ChangeView {
+                // E: tests, depends on A
                 change_id: "change-e".into(),
                 files: vec![fc("tests/auth_test.rs", vec![(1, 60)], vec![])],
                 dependencies: vec!["change-a".into()],
@@ -354,7 +388,11 @@ mod tests {
     fn overlapping_edits_are_textual() {
         let v = demo_views();
         let c = classify(&v[0], &v[2], &HashSet::new(), &demo_policy());
-        assert!(c.iter().any(|x| x.kind == ConflictKind::Textual), "A vs C: {:?}", c);
+        assert!(
+            c.iter().any(|x| x.kind == ConflictKind::Textual),
+            "A vs C: {:?}",
+            c
+        );
     }
 
     #[test]
@@ -362,14 +400,22 @@ mod tests {
         // A and C share AUTH-03: semantic conflict on top of the textual one.
         let v = demo_views();
         let c = classify(&v[0], &v[2], &HashSet::new(), &demo_policy());
-        assert!(c.iter().any(|x| x.kind == ConflictKind::Semantic), "A vs C: {:?}", c);
+        assert!(
+            c.iter().any(|x| x.kind == ConflictKind::Semantic),
+            "A vs C: {:?}",
+            c
+        );
     }
 
     #[test]
     fn forbidden_contract_is_policy_violation() {
         let v = demo_views();
         let c = classify(&v[3], &v[0], &HashSet::new(), &demo_policy());
-        assert!(c.iter().any(|x| x.kind == ConflictKind::Policy), "D: {:?}", c);
+        assert!(
+            c.iter().any(|x| x.kind == ConflictKind::Policy),
+            "D: {:?}",
+            c
+        );
     }
 
     #[test]
@@ -377,7 +423,11 @@ mod tests {
         let v = demo_views();
         let empty = HashSet::new();
         let c = classify(&v[4], &v[0], &empty, &demo_policy());
-        assert!(c.iter().any(|x| x.kind == ConflictKind::Dependency), "E vs A: {:?}", c);
+        assert!(
+            c.iter().any(|x| x.kind == ConflictKind::Dependency),
+            "E vs A: {:?}",
+            c
+        );
         let mut merged = HashSet::new();
         merged.insert("change-a".into());
         let c2 = classify(&v[4], &v[0], &merged, &demo_policy());
@@ -402,7 +452,10 @@ mod tests {
     #[test]
     fn index_maps_who_touches_what() {
         let idx = ChangeIndex::build(&demo_views());
-        assert_eq!(idx.by_file["src/auth.rs"], vec!["change-a", "change-b", "change-c"]);
+        assert_eq!(
+            idx.by_file["src/auth.rs"],
+            vec!["change-a", "change-b", "change-c"]
+        );
         assert_eq!(idx.by_invariant["AUTH-03"], vec!["change-a", "change-c"]);
     }
 }
@@ -423,11 +476,8 @@ pub fn enclosing_functions(source: &str, ranges: &[(u32, u32)]) -> Vec<String> {
     };
     let root = tree.root_node();
     // (function_item) @f with name field
-    let query = Query::new(
-        &lang.into(),
-        "(function_item name: (identifier) @name) @f",
-    )
-    .expect("query");
+    let query =
+        Query::new(&lang.into(), "(function_item name: (identifier) @name) @f").expect("query");
     let mut cursor = QueryCursor::new();
     let mut out = vec![];
     let mut it = cursor.matches(&query, root, source.as_bytes());

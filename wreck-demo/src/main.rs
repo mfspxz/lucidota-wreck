@@ -33,7 +33,10 @@ fn auth_baseline() -> Vec<String> {
     lines.push("".into());
     // lines 9..=39 (1-indexed): validate_token, 31 lines
     for i in 9..=39 {
-        lines.push(format!("fn validate_token_{}() {{ /* validation logic {} */ }}", i, i));
+        lines.push(format!(
+            "fn validate_token_{}() {{ /* validation logic {} */ }}",
+            i, i
+        ));
     }
     // 40..=44 separator
     for i in 40..=44 {
@@ -41,7 +44,10 @@ fn auth_baseline() -> Vec<String> {
     }
     // 45..=75: token_expiry, 31 lines
     for i in 45..=75 {
-        lines.push(format!("fn token_expiry_{}() {{ /* expiry logic {} */ }}", i, i));
+        lines.push(format!(
+            "fn token_expiry_{}() {{ /* expiry logic {} */ }}",
+            i, i
+        ));
     }
     // 76..=79 separator
     for i in 76..=79 {
@@ -49,7 +55,10 @@ fn auth_baseline() -> Vec<String> {
     }
     // 80..=110: retry_policy, 31 lines
     for i in 80..=110 {
-        lines.push(format!("fn retry_policy_{}() {{ /* retry logic {} */ }}", i, i));
+        lines.push(format!(
+            "fn retry_policy_{}() {{ /* retry logic {} */ }}",
+            i, i
+        ));
     }
     // 111..=114 separator
     for i in 111..=114 {
@@ -57,7 +66,10 @@ fn auth_baseline() -> Vec<String> {
     }
     // 115..=135: error handler, 21 lines
     for i in 115..=135 {
-        lines.push(format!("fn handle_auth_error_{}() {{ /* error logic {} */ }}", i, i));
+        lines.push(format!(
+            "fn handle_auth_error_{}() {{ /* error logic {} */ }}",
+            i, i
+        ));
     }
     assert_eq!(lines.len(), 135);
     lines
@@ -80,7 +92,8 @@ fn mk_claim(
     scope: Vec<ScopeItem>,
     invariants: &[&str],
 ) -> (ChangeClaim, Vec<String>) {
-    let mut c = ChangeClaim::propose(id, agent, "task-auth-001", base, head, intent).expect("valid change_id");
+    let mut c = ChangeClaim::propose(id, agent, "task-auth-001", base, head, intent)
+        .expect("valid change_id");
     c.scope = scope;
     c.claims.push(Claim {
         id: "C1".into(),
@@ -90,7 +103,9 @@ fn mk_claim(
     c.claims.push(Claim {
         id: "C2".into(),
         statement: format!("{} passes its invariants", id),
-        kind: ClaimKind::PassesInvariant { invariant: invariants.join(",") },
+        kind: ClaimKind::PassesInvariant {
+            invariant: invariants.join(","),
+        },
     });
     c.evidence.push(Evidence {
         id: "C1-E1".into(),
@@ -119,7 +134,10 @@ fn main() {
     let base_content = base_lines.join("\n") + "\n";
     let err_baseline = "// auth_err.rs — baseline\npub fn err_kind() -> u32 { 0 }\n";
     let base = git
-        .init_baseline(&[("src/auth.rs", &base_content), ("src/auth_err.rs", err_baseline)])
+        .init_baseline(&[
+            ("src/auth.rs", &base_content),
+            ("src/auth_err.rs", err_baseline),
+        ])
         .expect("init baseline");
     println!("baseline: {}", &base.as_str()[..12]);
 
@@ -134,49 +152,121 @@ fn main() {
         deps: Vec<&'static str>,
     }
     enum Edit {
-        Lines { start: usize, end: usize, with: Vec<String> },
-        File { path: &'static str, content: String },
+        Lines {
+            start: usize,
+            end: usize,
+            with: Vec<String>,
+        },
+        File {
+            path: &'static str,
+            content: String,
+        },
     }
 
     let works = vec![
-        AgentWork { // A: token validation
-            id: "change-a", agent: "agent-a", intent: "harden token validation",
-            edit: Edit::Lines { start: 9, end: 39,
-                with: (9..=39).map(|i| format!("fn validate_token_{}() {{ /* HARDENED {} */ }}", i, i)).collect() },
-            scope: vec![ScopeItem::File { path: "src/auth.rs".into() },
-                        ScopeItem::Symbol { name: "validate_token".into() }],
-            invariants: vec!["AUTH-03"], deps: vec![],
+        AgentWork {
+            // A: token validation
+            id: "change-a",
+            agent: "agent-a",
+            intent: "harden token validation",
+            edit: Edit::Lines {
+                start: 9,
+                end: 39,
+                with: (9..=39)
+                    .map(|i| format!("fn validate_token_{}() {{ /* HARDENED {} */ }}", i, i))
+                    .collect(),
+            },
+            scope: vec![
+                ScopeItem::File {
+                    path: "src/auth.rs".into(),
+                },
+                ScopeItem::Symbol {
+                    name: "validate_token".into(),
+                },
+            ],
+            invariants: vec!["AUTH-03"],
+            deps: vec![],
         },
-        AgentWork { // B: token expiry — same file, disjoint
-            id: "change-b", agent: "agent-b", intent: "shorten token expiry",
-            edit: Edit::Lines { start: 45, end: 75,
-                with: (45..=75).map(|i| format!("fn token_expiry_{}() {{ /* SHORTER {} */ }}", i, i)).collect() },
-            scope: vec![ScopeItem::File { path: "src/auth.rs".into() },
-                        ScopeItem::Symbol { name: "token_expiry".into() }],
-            invariants: vec!["AUTH-07"], deps: vec![],
+        AgentWork {
+            // B: token expiry — same file, disjoint
+            id: "change-b",
+            agent: "agent-b",
+            intent: "shorten token expiry",
+            edit: Edit::Lines {
+                start: 45,
+                end: 75,
+                with: (45..=75)
+                    .map(|i| format!("fn token_expiry_{}() {{ /* SHORTER {} */ }}", i, i))
+                    .collect(),
+            },
+            scope: vec![
+                ScopeItem::File {
+                    path: "src/auth.rs".into(),
+                },
+                ScopeItem::Symbol {
+                    name: "token_expiry".into(),
+                },
+            ],
+            invariants: vec!["AUTH-07"],
+            deps: vec![],
         },
-        AgentWork { // C: retry — overlaps A textually AND shares AUTH-03
-            id: "change-c", agent: "agent-c", intent: "aggressive retry policy",
-            edit: Edit::Lines { start: 30, end: 45,
-                with: (30..=45).map(|i| format!("fn retry_policy_{}() {{ /* AGGRESSIVE {} */ }}", i, i)).collect() },
-            scope: vec![ScopeItem::File { path: "src/auth.rs".into() },
-                        ScopeItem::Symbol { name: "retry_policy".into() }],
-            invariants: vec!["AUTH-03"], deps: vec![],
+        AgentWork {
+            // C: retry — overlaps A textually AND shares AUTH-03
+            id: "change-c",
+            agent: "agent-c",
+            intent: "aggressive retry policy",
+            edit: Edit::Lines {
+                start: 30,
+                end: 45,
+                with: (30..=45)
+                    .map(|i| format!("fn retry_policy_{}() {{ /* AGGRESSIVE {} */ }}", i, i))
+                    .collect(),
+            },
+            scope: vec![
+                ScopeItem::File {
+                    path: "src/auth.rs".into(),
+                },
+                ScopeItem::Symbol {
+                    name: "retry_policy".into(),
+                },
+            ],
+            invariants: vec!["AUTH-03"],
+            deps: vec![],
         },
-        AgentWork { // D: error semantics — forbidden contract
-            id: "change-d", agent: "agent-d", intent: "rewrite error handling",
-            edit: Edit::File { path: "src/auth_err.rs",
-                content: "// auth_err.rs — REWRITTEN\npub fn err_kind() -> u32 { 1 }\n".into() },
-            scope: vec![ScopeItem::File { path: "src/auth_err.rs".into() },
-                        ScopeItem::Contract { id: "auth.error-semantics".into() }],
-            invariants: vec![], deps: vec![],
+        AgentWork {
+            // D: error semantics — forbidden contract
+            id: "change-d",
+            agent: "agent-d",
+            intent: "rewrite error handling",
+            edit: Edit::File {
+                path: "src/auth_err.rs",
+                content: "// auth_err.rs — REWRITTEN\npub fn err_kind() -> u32 { 1 }\n".into(),
+            },
+            scope: vec![
+                ScopeItem::File {
+                    path: "src/auth_err.rs".into(),
+                },
+                ScopeItem::Contract {
+                    id: "auth.error-semantics".into(),
+                },
+            ],
+            invariants: vec![],
+            deps: vec![],
         },
-        AgentWork { // E: tests — depends on A
-            id: "change-e", agent: "agent-e", intent: "cover new validation",
-            edit: Edit::File { path: "tests/auth_test.rs",
-                content: "// tests\n#[test]\nfn validation_hardened() { assert!(true) }\n".into() },
-            scope: vec![ScopeItem::File { path: "tests/auth_test.rs".into() }],
-            invariants: vec![], deps: vec!["change-a"],
+        AgentWork {
+            // E: tests — depends on A
+            id: "change-e",
+            agent: "agent-e",
+            intent: "cover new validation",
+            edit: Edit::File {
+                path: "tests/auth_test.rs",
+                content: "// tests\n#[test]\nfn validation_hardened() { assert!(true) }\n".into(),
+            },
+            scope: vec![ScopeItem::File {
+                path: "tests/auth_test.rs".into(),
+            }],
+            invariants: vec![],
+            deps: vec!["change-a"],
         },
     ];
 
@@ -188,13 +278,26 @@ fn main() {
         let fork = git.fork(w.id).expect("fork");
         let new_content: Vec<(&str, String)> = match &w.edit {
             Edit::Lines { start, end, with } => {
-                vec![("src/auth.rs", replace_lines(base_lines.clone(), *start, *end, with.clone()))]
+                vec![(
+                    "src/auth.rs",
+                    replace_lines(base_lines.clone(), *start, *end, with.clone()),
+                )]
             }
             Edit::File { path, content } => vec![(*path, content.clone())],
         };
         let refs: Vec<(&str, &str)> = new_content.iter().map(|(p, c)| (*p, c.as_str())).collect();
-        let head = git.commit_change(&fork, &refs, &format!("{}: {}", w.id, w.intent)).expect("commit");
-        let (mut claim, invs) = mk_claim(w.id, w.agent, base.clone(), head.clone(), w.intent, w.scope.clone(), &w.invariants);
+        let head = git
+            .commit_change(&fork, &refs, &format!("{}: {}", w.id, w.intent))
+            .expect("commit");
+        let (mut claim, invs) = mk_claim(
+            w.id,
+            w.agent,
+            base.clone(),
+            head.clone(),
+            w.intent,
+            w.scope.clone(),
+            &w.invariants,
+        );
         // the claim rides WITH the push: amend the commit message with the trailer.
         // (the push event's `after` SHA stays authoritative for the head;
         // the trailer carries the semantic proposal: intent/scope/claims/evidence)
@@ -210,9 +313,12 @@ fn main() {
         let parsed = ChangeClaim::from_trailer(&String::from_utf8_lossy(&check.stdout))
             .expect("trailer parses");
         assert_eq!(parsed.change_id, w.id);
-        let mut view = git.diff_view(w.id, &w.scope, &fork, &base, &head).expect("diff");
+        let mut view = git
+            .diff_view(w.id, &w.scope, &fork, &base, &head)
+            .expect("diff");
         // symbols: measured via tree-sitter, not declared
-        git.measure_symbols(&fork, &head, &mut view).expect("measure");
+        git.measure_symbols(&fork, &head, &mut view)
+            .expect("measure");
         view.invariants = invs;
         view.dependencies = w.deps.iter().map(|s| s.to_string()).collect();
         forks.insert(w.id.to_string(), fork);
@@ -226,8 +332,15 @@ fn main() {
     let canon = wreck_canon::demo_canon();
     let policy = canon.to_policy();
     println!("canon rules active: {}", canon.active().len());
-    let mut gov = Governor::new(policy, b"demo-authority-key-32bytes-padded!".to_vec(), "governor");
-    let port = LocalMergePort { baseline: git.baseline_path(), forks };
+    let mut gov = Governor::new(
+        policy,
+        b"demo-authority-key-32bytes-padded!".to_vec(),
+        "governor",
+    );
+    let port = LocalMergePort {
+        baseline: git.baseline_path(),
+        forks,
+    };
     let mut merged: HashSet<String> = HashSet::new();
     let mut seen: Vec<ChangeView> = vec![];
 
@@ -237,24 +350,48 @@ fn main() {
     for (idx, (claim, view)) in claims.iter_mut().zip(views.iter()).enumerate() {
         // re-evaluate blocked claims after each merge (dependency may clear)
         let ts = "2026-10-08T21:30:00Z";
-        let d = gov.evaluate(claim, view, &seen, &merged, &port, ts).expect("evaluate");
-        let seal: String = d.receipt.get("seal").and_then(|v| v.as_str()).unwrap_or("?")[..12].into();
+        let d = gov
+            .evaluate(claim, view, &seen, &merged, &port, ts)
+            .expect("evaluate");
+        let seal: String = d
+            .receipt
+            .get("seal")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")[..12]
+            .into();
         match &d.verdict {
             Verdict::Accept => {
                 stats.0 += 1;
                 merged.insert(claim.change_id.clone());
-                println!("  {:<10} ACCEPT   seal {}   status {:?}", claim.agent_id, seal, claim.status);
+                println!(
+                    "  {:<10} ACCEPT   seal {}   status {:?}",
+                    claim.agent_id, seal, claim.status
+                );
             }
             Verdict::Reject { reason, rule } => {
                 stats.1 += 1;
-                println!("  {:<10} REJECT   [{}] {}   seal {}", claim.agent_id, rule, short(reason), seal);
+                println!(
+                    "  {:<10} REJECT   [{}] {}   seal {}",
+                    claim.agent_id,
+                    rule,
+                    short(reason),
+                    seal
+                );
             }
             Verdict::Blocked { by } => {
                 stats.2 += 1;
-                println!("  {:<10} BLOCKED  waiting on {:?}   seal {}", claim.agent_id, by, seal);
+                println!(
+                    "  {:<10} BLOCKED  waiting on {:?}   seal {}",
+                    claim.agent_id, by, seal
+                );
             }
             Verdict::NeedsRebase { onto } => {
-                println!("  {:<10} REBASE   onto {}   seal {}", claim.agent_id, &onto[..12.min(onto.len())], seal);
+                println!(
+                    "  {:<10} REBASE   onto {}   seal {}",
+                    claim.agent_id,
+                    &onto[..12.min(onto.len())],
+                    seal
+                );
             }
         }
         decisions[idx] = Some(d);
@@ -265,21 +402,34 @@ fn main() {
         if !matches!(claim.status, wreck_protocol::ChangeStatus::Proven) {
             continue;
         }
-        let d = gov.evaluate(claim, view, &seen, &merged, &port, "2026-10-08T21:31:00Z").expect("re-evaluate");
-        let seal: String = d.receipt.get("seal").and_then(|v| v.as_str()).unwrap_or("?")[..12].into();
+        let d = gov
+            .evaluate(claim, view, &seen, &merged, &port, "2026-10-08T21:31:00Z")
+            .expect("re-evaluate");
+        let seal: String = d
+            .receipt
+            .get("seal")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")[..12]
+            .into();
         match &d.verdict {
             Verdict::Accept => {
                 stats.0 += 1;
                 stats.2 -= 1;
                 merged.insert(claim.change_id.clone());
-                println!("  {:<10} ACCEPT   (retry after dependency) seal {}", claim.agent_id, seal);
+                println!(
+                    "  {:<10} ACCEPT   (retry after dependency) seal {}",
+                    claim.agent_id, seal
+                );
             }
             other => println!("  {:<10} still {:?} seal {}", claim.agent_id, other, seal),
         }
         decisions[idx] = Some(d);
     }
     println!("+====================================+");
-    println!("\n  5 agents  |  5 changes  |  {} accepted  |  {} rejected  |  {} blocked", stats.0, stats.1, stats.2);
+    println!(
+        "\n  5 agents  |  5 changes  |  {} accepted  |  {} rejected  |  {} blocked",
+        stats.0, stats.1, stats.2
+    );
     println!("  human merge decisions: 0");
     println!("  decisions sealed: {}", gov.decisions_sealed());
 
@@ -301,16 +451,26 @@ fn main() {
         .map(|((claim, view), d)| {
             let d = d.as_ref().expect("decision per claim");
             let (verdict, badge_class, detail) = match &d.verdict {
-                Verdict::Accept => ("ACCEPT".to_string(), "accept".to_string(), "all checks passed".to_string()),
-                Verdict::Reject { reason, rule } => {
-                    ("REJECT".to_string(), "reject".to_string(), format!("[{}] {}", rule, short(reason)))
-                }
-                Verdict::Blocked { by } => {
-                    ("BLOCKED".to_string(), "blocked".to_string(), format!("waiting on {:?}", by))
-                }
-                Verdict::NeedsRebase { onto } => {
-                    ("REBASE".to_string(), "blocked".to_string(), format!("onto {}", &onto[..12.min(onto.len())]))
-                }
+                Verdict::Accept => (
+                    "ACCEPT".to_string(),
+                    "accept".to_string(),
+                    "all checks passed".to_string(),
+                ),
+                Verdict::Reject { reason, rule } => (
+                    "REJECT".to_string(),
+                    "reject".to_string(),
+                    format!("[{}] {}", rule, short(reason)),
+                ),
+                Verdict::Blocked { by } => (
+                    "BLOCKED".to_string(),
+                    "blocked".to_string(),
+                    format!("waiting on {:?}", by),
+                ),
+                Verdict::NeedsRebase { onto } => (
+                    "REBASE".to_string(),
+                    "blocked".to_string(),
+                    format!("onto {}", &onto[..12.min(onto.len())]),
+                ),
             };
             dashboard::Row {
                 agent: claim.agent_id.clone(),
@@ -318,8 +478,17 @@ fn main() {
                 verdict,
                 badge_class,
                 detail,
-                conflicts: d.conflicts.iter().map(|c| format!("[{:?}] {}", c.kind, c.detail)).collect(),
-                seal: d.receipt.get("seal").and_then(|v| v.as_str()).unwrap_or("?")[..12].to_string(),
+                conflicts: d
+                    .conflicts
+                    .iter()
+                    .map(|c| format!("[{:?}] {}", c.kind, c.detail))
+                    .collect(),
+                seal: d
+                    .receipt
+                    .get("seal")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")[..12]
+                    .to_string(),
                 status: format!("{:?}", claim.status),
                 files: view.files.iter().map(|f| f.path.clone()).collect(),
                 invariants: view.invariants.clone(),
@@ -348,7 +517,11 @@ fn main() {
     use wreck_protocol::ChangeStatus::*;
     assert_eq!(status("change-a"), Merged, "A must merge");
     assert_eq!(status("change-b"), Merged, "B must merge");
-    assert_eq!(status("change-c"), Rejected, "C must be rejected (conflict vs A)");
+    assert_eq!(
+        status("change-c"),
+        Rejected,
+        "C must be rejected (conflict vs A)"
+    );
     assert_eq!(status("change-d"), Rejected, "D must be rejected (policy)");
     assert_eq!(status("change-e"), Merged, "E must merge after A");
     println!("\nDEMO CONTRACT HOLDS: A,B,E merged | C,D rejected | 0 human merges");
