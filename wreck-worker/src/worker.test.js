@@ -6,11 +6,15 @@ import assert from "node:assert/strict";
 import { InvalidEvent, dedupKey, parseEvent } from "./event.js";
 import {
   activePolicy,
+  callWasm,
   claimFromCommit,
+  handleMessage,
   handlePush,
   inFlightViews,
   mergedIds,
 } from "./worker.js";
+import worker from "./worker.js";
+import { IdempotencyGate } from "./idempotency.js";
 
 // The official cf.artifacts.repo.pushed shape (nested), per
 // wreck-adapters/src/artifacts.rs PushedEvent — the reference shape.
@@ -231,4 +235,196 @@ test("H3: failed processing never writes the dedup key (redelivery safe)", async
     /unwired/,
   );
   assert.equal(env.calls.put.length, 0, "KV.put must not happen on failure");
+});
+
+// ---------- M5: atomic idempotency gate ----------
+
+test("M5: IdempotencyGate claim/release lifecycle", async () => {
+  const gate = new IdempotencyGate();
+  const store = new Map();
+  const kv = { async get(k) { return store.get(k) ?? null; } };
+  assert.equal(await gate.claim("k1", kv), "claimed");
+  assert.equal(await gate.claim("k1", kv), "inflight");
+  gate.release("k1");
+  assert.equal(await gate.claim("k1", kv), "claimed");
+  gate.release("k1");
+  store.set("k1", "1");
+  assert.equal(await gate.claim("k1", kv), "processed");
+  gate.release("missing"); // idempotent, never throws
+});
+
+test("M5: concurrent duplicate events — exactly one processes, other retries", async () => {
+  const env = mockEnv([]);
+  const gate = new IdempotencyGate();
+  let decides = 0;
+  const deps = {
+    inFlight: async () => [],
+    merged: async () => [],
+    policy: async () => ({ rules: [] }),
+    decide: () => {
+      decides++;
+      return { outcome: "decided", decision: { verdict: "Accept" } };
+    },
+    record: async () => {},
+    notify: async () => {},
+    idempotency: gate,
+  };
+  const results = await Promise.allSettled([
+    handlePush(officialEvent("task-m5"), env, null, deps),
+    handlePush(officialEvent("task-m5"), env, null, deps),
+  ]);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+  const rejected = results.find((r) => r.status === "rejected");
+  assert.match(rejected.reason.message, /already in flight/);
+  assert.equal(decides, 1, "double-govern must be impossible");
+  // the winner wrote the KV key; a later redelivery is "processed", not re-decided
+  await handlePush(officialEvent("task-m5"), env, null, deps);
+  assert.equal(decides, 1, "processed key skips without deciding");
+});
+
+test("M5: failed processing releases the claim (no wedging)", async () => {
+  const env = mockEnv([]);
+  const gate = new IdempotencyGate();
+  const failing = {
+    inFlight: async () => { throw new Error("boom"); },
+    merged: async () => [],
+    policy: async () => ({ rules: [] }),
+    idempotency: gate,
+  };
+  await assert.rejects(handlePush(officialEvent("task-m5b"), env, null, failing), /boom/);
+  // the claim was released: a retry can claim again instead of seeing "inflight" forever
+  assert.equal(await gate.claim("wreck:seen:wreck:task-m5b:refs/heads/main:" + "a".repeat(40) + ":" + "b".repeat(40), { async get() { return null; } }), "claimed");
+});
+
+// ---------- M6: per-call WASM allocator ----------
+
+// Mock WASM module: bump allocator over a real ArrayBuffer, echo decide.
+function mockWasm() {
+  const buffer = new ArrayBuffer(4 * 1024 * 1024);
+  let next = 4096; // leave the low pages alone, like a real module
+  const allocs = [];
+  const frees = [];
+  const api = {
+    allocs,
+    frees,
+    memory: { buffer },
+    wreck_alloc(size) {
+      if (size === 0 || next + size > buffer.byteLength) return 0;
+      const ptr = next;
+      next += size;
+      allocs.push([ptr, size]);
+      new Uint8Array(buffer, ptr, size).fill(0); // zeroed, like the Rust impl
+      return ptr;
+    },
+    wreck_free(ptr, size) {
+      frees.push([ptr, size]);
+      return 0;
+    },
+    wreck_decide(inPtr, inLen, outPtr, outCap) {
+      const input = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, inPtr, inLen)));
+      const out = JSON.stringify({ outcome: "decided", gotIntent: input.claim?.intent ?? null });
+      const bytes = new TextEncoder().encode(out);
+      new Uint8Array(buffer, outPtr, bytes.length).set(bytes);
+      return bytes.length;
+    },
+    wreck_boom(inPtr, inLen, outPtr, outCap) {
+      const bytes = new TextEncoder().encode(JSON.stringify({ error: "kaboom" }));
+      new Uint8Array(buffer, outPtr, bytes.length).set(bytes);
+      return -1;
+    },
+    wreck_tiny(inPtr, inLen, outPtr, outCap) {
+      return -2;
+    },
+  };
+  return api;
+}
+
+test("M6: callWasm allocates per call and frees everything", () => {
+  const w = mockWasm();
+  const out = callWasm(w, "wreck_decide", { claim: { intent: "hi" } });
+  assert.equal(out.outcome, "decided");
+  assert.equal(out.gotIntent, "hi");
+  // one input alloc + one output alloc, both freed, no overlap
+  assert.equal(w.allocs.length, 2);
+  assert.equal(w.frees.length, 2);
+  assert.deepEqual(
+    w.frees.map(([p]) => p).sort((a, b) => a - b),
+    w.allocs.map(([p]) => p).sort((a, b) => a - b),
+    "every alloc must be freed",
+  );
+  const [[p1], [p2]] = [w.allocs[0], w.allocs[1]].sort((a, b) => a[0] - b[0]);
+  assert.ok(p1 !== p2, "input and output regions must not alias");
+});
+
+test("M6: callWasm surfaces the Rust error envelope", () => {
+  const w = mockWasm();
+  assert.throws(() => callWasm(w, "wreck_boom", {}), /kaboom/);
+  // buffers still freed on the error path
+  assert.equal(w.frees.length, 2);
+});
+
+test("M6: callWasm fails closed on missing exports and oversized input", () => {
+  const w = mockWasm();
+  assert.throws(() => callWasm({}, "wreck_decide", {}), /not exported/);
+  assert.throws(() => callWasm(w, "nope", {}), /is not a function/);
+  assert.throws(
+    () => callWasm(w, "wreck_decide", { big: "x".repeat(2 * 1024 * 1024) }),
+    /cap_exceeded/,
+    "input cap must fire before alloc",
+  );
+  assert.throws(() => callWasm(w, "wreck_tiny", {}), /output too small/);
+});
+
+// ---------- L1: no unauthenticated catch-all ----------
+
+test("L1: /v1/health returns 200 with a minimal body", async () => {
+  const res = await worker.fetch(new Request("https://w/v1/health"), {});
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true });
+});
+
+test("L1: unknown paths 404 instead of 200", async () => {
+  for (const path of ["/", "/v1/decide", "/admin", "/v1/health/extra"]) {
+    const res = await worker.fetch(new Request(`https://w${path}`), {});
+    assert.equal(res.status, 404, `path ${path} must not 200`);
+  }
+});
+
+// ---------- L4: cap before touch on queue messages ----------
+
+function mockMsg(body) {
+  const calls = [];
+  return {
+    body,
+    calls,
+    ack() { calls.push("ack"); },
+    retry() { calls.push("retry"); },
+  };
+}
+
+test("L4: over-cap STRING body is poison (acked, never retried)", async () => {
+  const msg = mockMsg("x".repeat(16_384 + 1));
+  await handleMessage(msg, {}, null);
+  assert.deepEqual(msg.calls, ["ack"], "poison must be acked, not retried");
+});
+
+test("L4: over-cap OBJECT body is poison without a second full copy", async () => {
+  const msg = mockMsg({ chunks: Array.from({ length: 2000 }, (_, i) => "x".repeat(500) + i) });
+  await handleMessage(msg, {}, null);
+  assert.deepEqual(msg.calls, ["ack"], "poison must be acked, not retried");
+});
+
+test("L4: valid string body is parsed and reaches handlePush", async () => {
+  // handlePush with the real (unwired) state sources throws /unwired/,
+  // which is a retry — proving the body passed the cap and was parsed.
+  const msg = mockMsg(JSON.stringify(officialEvent("task-l4")));
+  await handleMessage(msg, mockEnv([]), null);
+  assert.deepEqual(msg.calls, ["retry"], "valid body must be parsed, then retried on unwired state");
+});
+
+test("L4: at-cap object body passes the measurer", async () => {
+  const small = officialEvent("task-l4b");
+  const msg = mockMsg(small);
+  await handleMessage(msg, mockEnv([]), null);
+  assert.deepEqual(msg.calls, ["retry"], "at-cap object must pass measurement");
 });

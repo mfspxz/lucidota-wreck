@@ -27,9 +27,15 @@ import {
   EVENT_CAP,
   WASM_INPUT_CAP,
   checkCap,
+  measureJsonBytes,
   utf8Len,
 } from "./caps.js";
 import { InvalidEvent, dedupKey, parseEvent } from "./event.js";
+import { IdempotencyGate } from "./idempotency.js";
+
+// One gate per isolate: the in-flight set is isolate memory, so a crash
+// loses it (safe — the H3 KV key is only written after success).
+const defaultGate = new IdempotencyGate();
 
 let wasm = null;
 let memory = null;
@@ -70,6 +76,11 @@ function callWasm(w, fn, inputObj, outCap = 65536) {
     new Uint8Array(w.memory.buffer, inPtr, input.length).set(input);
     const rc = w[fn](inPtr, input.length, outPtr, outCap);
     const mem = () => new Uint8Array(w.memory.buffer);
+    if (rc === -2) {
+      // output buffer too small: the Rust side wrote nothing; fail closed
+      // with a clear message so the caller retries with a larger outCap
+      throw new Error(`wreck: ${fn} failed: output too small (${outCap} bytes) — retry with larger outCap`);
+    }
     if (rc < 0) {
       // error envelope is a NUL-terminated {"error":...} (see wreck-wasm call())
       const raw = new TextDecoder().decode(mem().subarray(outPtr, outPtr + outCap));
@@ -118,22 +129,33 @@ export default {
     }
   },
 
-  /** Manual trigger / health */
+  /** Manual trigger / health. L1 (cycle-06 audit): no unauthenticated
+   * catch-all — unknown paths 404 instead of 200, so probing learns nothing
+   * beyond the health endpoint's existence. */
   async fetch(req, env) {
     const url = new URL(req.url);
     if (url.pathname === "/v1/health") {
-      return Response.json({ ok: true, service: "wreck-governor", mode: "scaffold" });
+      return Response.json({ ok: true });
     }
-    return new Response("wreck governor scaffold", { status: 200 });
+    return new Response("not found", { status: 404 });
   },
 };
 
 /** One queue message: poison (CapExceeded/InvalidEvent) is acked, never retried. */
 async function handleMessage(msg, env, w) {
   try {
-    // cap the queue message body before touching it: 16 KiB, reject-never-truncate
-    checkCap(utf8Len(JSON.stringify(msg.body)), EVENT_CAP, "queue message body");
-    await handlePush(msg.body, env, w);
+    // L4: cap the queue message body BEFORE touching it (16 KiB,
+    // reject-never-truncate). String bodies are measured directly;
+    // objects are measured without materializing a second full copy.
+    let body;
+    if (typeof msg.body === "string") {
+      checkCap(utf8Len(msg.body), EVENT_CAP, "queue message body");
+      body = JSON.parse(msg.body);
+    } else {
+      measureJsonBytes(msg.body, EVENT_CAP, "queue message body");
+      body = msg.body;
+    }
+    await handlePush(body, env, w);
     msg.ack();
   } catch (err) {
     if (err instanceof CapExceeded || err instanceof InvalidEvent) {
@@ -160,6 +182,9 @@ async function handlePush(event, env, w, deps = {}) {
     inFlight = (e, n) => inFlightViews(e, n),
     merged = (e, n) => mergedIds(e, n),
     policy = (e) => activePolicy(e),
+    // M5: atomic idempotency gate (injectable for tests; the module-level
+    // default is the per-isolate production gate).
+    idempotency = defaultGate,
   } = deps;
 
   // C1: validate the nested official shape at the boundary. Throws
@@ -169,69 +194,83 @@ async function handlePush(event, env, w, deps = {}) {
   // baseline repo pushes are the governor's own merges — never re-govern.
   if (ev.repoName === "baseline") return;
 
+  // M5: atomic claim. "processed" → skip (ack); "inflight" → another call
+  // in this isolate owns it, so do NOT ack (it might crash) — throw and
+  // retry later. Cross-isolate double-claim remains possible until the
+  // Durable Object merge lease lands; see idempotency.js.
   const key = dedupKey(ev);
-  if (await env.GOVERNOR_KV.get(key)) return; // already processed
-
-  // retry-read: the event can arrive before the commit is readable
-  const after = await waitVisible(env, ev, 5);
-
-  // build the mechanical view: tree diff before/after
-  const view = await buildView(env, ev, after);
-
-  // the claim: agents submit claims with their push (commit trailer
-  // `Wreck-Claim: <json>`); without one the governor still runs on the
-  // measured diff, with zero declared semantics.
-  const claim = claimFromCommit(ev, after);
-
-  // ---- the decision: 100% Rust, via WASM ----
-  // H1: no key_hex — the authority key lives in WASM-static memory.
-  const decideOut = decide({
-    claim,
-    view,
-    in_flight: await inFlight(env, ev.namespace),
-    merged: await merged(env, ev.namespace),
-    policy: await policy(env),
-    actor: "wreck-governor",
-    ts: new Date().toISOString(),
-  });
-
-  if (decideOut.outcome === "decided") {
-    await record(env, decideOut.decision);
-    await notify(env, claim, decideOut.decision);
-  } else {
-    // M5 (cycle-06 audit): the KV dedup gate is check-then-set — advisory
-    // only, because KV has no CAS (the Durable Object single-writer lease
-    // is the real fix, still planned). A duplicate consumer can reach this
-    // point, so re-check the merged set immediately before merging: a
-    // double-merge is impossible. Worst case is a wasted duplicate decide,
-    // never a spurious MERGE-FAILED after a real merge.
-    const mergedNow = await merged(env, ev.namespace);
-    if (!mergedNow.includes(ev.repoName)) {
-      // ACCEPT pending: merge, then seal.
-      const mergeSha = await merge(env, ev, decideOut.draft);
-      const completeOut = complete({
-        draft: decideOut.draft,
-        claim: decideOut.claim,
-        merge_sha: mergeSha,
-        port: "artifacts",
-        // M3: the persisted chain head (D1). Null until recordDecision is
-        // wired — the WASM core then self-attests (documented gap).
-        expected_parent_seal: null,
-        actor: "wreck-governor",
-        ts: new Date().toISOString(),
-      });
-      await record(env, completeOut.decision);
-      await notify(env, claim, completeOut.decision);
-    }
-    // else: another consumer already governed and merged this change —
-    // idempotent no-op; the dedup key is still written below.
+  const claimState = await idempotency.claim(key, env.GOVERNOR_KV);
+  if (claimState === "processed") return;
+  if (claimState === "inflight") {
+    throw new Error(`wreck: event ${key} already in flight in this isolate — retry`);
   }
+  try {
+    // retry-read: the event can arrive before the commit is readable
+    const after = await waitVisible(env, ev, 5);
 
-  // H3: the dedup key is written ONLY after successful processing. A crash
-  // before this line redelivers the event (safe: reprocessing is
-  // idempotent); a crash after is covered by the key. Writing it earlier
-  // would silently drop the change on crash.
-  await env.GOVERNOR_KV.put(key, "1", { expirationTtl: 86400 });
+    // build the mechanical view: tree diff before/after
+    const view = await buildView(env, ev, after);
+
+    // the claim: agents submit claims with their push (commit trailer
+    // `Wreck-Claim: <json>`); without one the governor still runs on the
+    // measured diff, with zero declared semantics.
+    const claim = claimFromCommit(ev, after);
+
+    // ---- the decision: 100% Rust, via WASM ----
+    // H1: no key_hex — the authority key lives in WASM-static memory.
+    const decideOut = decide({
+      claim,
+      view,
+      in_flight: await inFlight(env, ev.namespace),
+      merged: await merged(env, ev.namespace),
+      policy: await policy(env),
+      actor: "wreck-governor",
+      ts: new Date().toISOString(),
+    });
+
+    if (decideOut.outcome === "decided") {
+      await record(env, decideOut.decision);
+      await notify(env, claim, decideOut.decision);
+    } else {
+      // M5 (cycle-06 audit): the KV dedup gate is check-then-set — advisory
+      // only, because KV has no CAS (the Durable Object single-writer lease
+      // is the real fix, still planned). A duplicate consumer can reach this
+      // point, so re-check the merged set immediately before merging: a
+      // double-merge is impossible. Worst case is a wasted duplicate decide,
+      // never a spurious MERGE-FAILED after a real merge.
+      const mergedNow = await merged(env, ev.namespace);
+      if (!mergedNow.includes(ev.repoName)) {
+        // ACCEPT pending: merge, then seal.
+        const mergeSha = await merge(env, ev, decideOut.draft);
+        const completeOut = complete({
+          draft: decideOut.draft,
+          claim: decideOut.claim,
+          merge_sha: mergeSha,
+          port: "artifacts",
+          // M3: the persisted chain head (D1). Null until recordDecision is
+          // wired — the WASM core then self-attests (documented gap).
+          expected_parent_seal: null,
+          actor: "wreck-governor",
+          ts: new Date().toISOString(),
+        });
+        await record(env, completeOut.decision);
+        await notify(env, claim, completeOut.decision);
+      }
+      // else: another consumer already governed and merged this change —
+      // idempotent no-op; the dedup key is still written below.
+    }
+
+    // H3: the dedup key is written ONLY after successful processing. A crash
+    // before this line redelivers the event (safe: reprocessing is
+    // idempotent); a crash after is covered by the key. Writing it earlier
+    // would silently drop the change on crash.
+    await env.GOVERNOR_KV.put(key, "1", { expirationTtl: 86400 });
+  } finally {
+    // M5: always release the in-isolate claim — success (KV key now
+    // covers it), failure, or throw (H2). A leaked claim would wedge
+    // every redelivery of this event into "inflight" forever.
+    idempotency.release(key);
+  }
 }
 
 /** Poll the binding until `after` is readable (usually immediate). */
@@ -395,4 +434,4 @@ async function notifyAgent(env, claim, decision) {
 
 // Named exports for unit tests (node --test). The default export above is
 // the Worker entrypoint.
-export { handlePush, handleMessage, claimFromCommit, inFlightViews, mergedIds, activePolicy, initAuthorityKey };
+export { handlePush, handleMessage, claimFromCommit, inFlightViews, mergedIds, activePolicy, initAuthorityKey, callWasm };
