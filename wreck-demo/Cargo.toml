@@ -1,0 +1,15 @@
+[package]
+name = "wreck-demo"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wreck-demo"
+path = "src/main.rs"
+
+[dependencies]
+wreck-protocol = { path = "../wreck-protocol" }
+wreck-graph = { path = "../wreck-graph" }
+wreck-governor = { path = "../wreck-governor" }
+wreck-adapters = { path = "../wreck-adapters" }
+serde_json = "1"

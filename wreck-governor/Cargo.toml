@@ -1,0 +1,9 @@
+[package]
+name = "wreck-governor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wreck-protocol = { path = "../wreck-protocol" }
+wreck-graph = { path = "../wreck-graph" }
+serde_json = "1"
