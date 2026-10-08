@@ -15,6 +15,13 @@
  */
 
 import wasmBytes from "./wreck_wasm.wasm";
+import {
+  CapExceeded,
+  EVENT_CAP,
+  WASM_INPUT_CAP,
+  checkCap,
+  utf8Len,
+} from "./caps.js";
 
 let wasm = null;
 let memory = null;
@@ -29,6 +36,8 @@ async function getWasm() {
 
 function callWasm(fn, inputObj, outCap = 65536) {
   const input = new TextEncoder().encode(JSON.stringify(inputObj));
+  // cap before the WASM boundary: 1 MiB, reject-never-truncate
+  checkCap(input.length, WASM_INPUT_CAP, `wasm ${fn} input`);
   const inPtr = 0; // NOTE: real impl needs an allocator export; scaffold uses fixed regions
   // ---- TODO(hardening): export wreck_alloc from the wasm module instead ----
   throw new Error("scaffold: wire the wasm allocator before deploy");
@@ -47,12 +56,20 @@ export default {
     const w = await getWasm();
     for (const msg of batch.messages) {
       try {
+        // cap the queue message body before touching it: 16 KiB, reject-never-truncate
+        checkCap(utf8Len(JSON.stringify(msg.body)), EVENT_CAP, "queue message body");
         await handlePush(msg.body, env, w);
         msg.ack();
       } catch (err) {
-        // at-least-once: retry later; dedup key makes reprocessing safe
-        console.error("wreck: handlePush failed, will retry", err);
-        msg.retry();
+        if (err instanceof CapExceeded) {
+          // poison message: deterministically oversized, retry can never succeed
+          console.error("wreck: cap exceeded, dropping poison message", err.message);
+          msg.ack();
+        } else {
+          // at-least-once: retry later; dedup key makes reprocessing safe
+          console.error("wreck: handlePush failed, will retry", err);
+          msg.retry();
+        }
       }
     }
   },
@@ -68,6 +85,8 @@ export default {
 };
 
 async function handlePush(event, env, w) {
+  // cap the push-event payload before touching it: 16 KiB, reject-never-truncate
+  checkCap(utf8Len(JSON.stringify(event)), EVENT_CAP, "push event payload");
   // event shape: { namespace, repo, ref, before, after, commits[] }
   // baseline repo pushes are the governor's own merges — never re-govern.
   if (event.repo === "baseline") return;
@@ -180,6 +199,8 @@ function claimFromCommit(event, after) {
   // with zero declared semantics.
   const msg = (after.message || "");
   const line = msg.split("\n").find((l) => l.startsWith("Wreck-Claim:"));
+  // cap the claim trailer before parsing: 16 KiB, reject-never-truncate
+  if (line) checkCap(utf8Len(line), EVENT_CAP, "Wreck-Claim trailer");
   const base = {
     change_id: event.repo,
     agent_id: (after.author && after.author.name) || "unknown",
