@@ -406,3 +406,104 @@ mod tests {
         assert_eq!(idx.by_invariant["AUTH-03"], vec!["change-a", "change-c"]);
     }
 }
+
+/// Measured symbol extraction: parse Rust source with tree-sitter and return
+/// the names of `function_item`s whose line span intersects any changed
+/// range. This makes symbols MEASURED instead of agent-declared — the
+/// foundation for structural (not textual) conflict classification.
+pub fn enclosing_functions(source: &str, ranges: &[(u32, u32)]) -> Vec<String> {
+    use streaming_iterator::StreamingIterator;
+    use tree_sitter::{Parser, Query, QueryCursor};
+    let mut parser = Parser::new();
+    let lang = tree_sitter_rust::LANGUAGE;
+    parser.set_language(&lang.into()).expect("rust grammar");
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return vec![],
+    };
+    let root = tree.root_node();
+    // (function_item) @f with name field
+    let query = Query::new(
+        &lang.into(),
+        "(function_item name: (identifier) @name) @f",
+    )
+    .expect("query");
+    let mut cursor = QueryCursor::new();
+    let mut out = vec![];
+    let mut it = cursor.matches(&query, root, source.as_bytes());
+    while let Some(m) = {
+        it.advance();
+        it.get()
+    } {
+        let mut name = None;
+        let mut fnode = None;
+        for cap in m.captures {
+            let idx = cap.index as usize;
+            let cap_name = query.capture_names()[idx];
+            if cap_name == "name" {
+                name = Some(
+                    cap.node
+                        .utf8_text(source.as_bytes())
+                        .unwrap_or("")
+                        .to_string(),
+                );
+            } else if cap_name == "f" {
+                fnode = Some(cap.node);
+            }
+        }
+        if let (Some(n), Some(f)) = (name, fnode) {
+            let start = f.start_position().row as u32 + 1; // 1-indexed
+            let end = f.end_position().row as u32 + 1;
+            if ranges.iter().any(|(s, e)| *s <= end && start <= *e) {
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod structural_tests {
+    use super::enclosing_functions;
+
+    const SRC: &str = r#"fn alpha() {
+    let x = 1;
+}
+
+fn beta() {
+    let y = 2;
+}
+
+fn gamma() {
+    let z = 3;
+}
+"#;
+
+    #[test]
+    fn finds_enclosing_function() {
+        // lines 5-7 are beta (1-indexed)
+        let syms = enclosing_functions(SRC, &[(5, 7)]);
+        assert_eq!(syms, vec!["beta"]);
+    }
+
+    #[test]
+    fn multiple_ranges() {
+        let syms = enclosing_functions(SRC, &[(1, 3), (9, 11)]);
+        assert_eq!(syms, vec!["alpha", "gamma"]);
+    }
+
+    #[test]
+    fn no_overlap_no_symbols() {
+        let syms = enclosing_functions(SRC, &[(4, 4)]);
+        assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn invalid_source_is_empty() {
+        let syms = enclosing_functions("fn broken((", &[(1, 1)]);
+        assert!(syms.is_empty());
+    }
+}

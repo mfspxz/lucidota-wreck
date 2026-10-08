@@ -196,6 +196,8 @@ fn main() {
         let head = git.commit_change(&fork, &refs, &format!("{}: {}", w.id, w.intent)).expect("commit");
         let (claim, invs) = mk_claim(w.id, w.agent, base.clone(), head.clone(), w.intent, w.scope.clone(), &w.invariants);
         let mut view = git.diff_view(w.id, &w.scope, &fork, &base, &head).expect("diff");
+        // symbols: measured via tree-sitter, not declared
+        git.measure_symbols(&fork, &head, &mut view).expect("measure");
         view.invariants = invs;
         view.dependencies = w.deps.iter().map(|s| s.to_string()).collect();
         forks.insert(w.id.to_string(), fork);

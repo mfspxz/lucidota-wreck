@@ -2,6 +2,7 @@
 name = "wreck-demo"
 version = "0.1.0"
 edition = "2021"
+default-run = "wreck-demo"
 
 [[bin]]
 name = "wreck-demo"

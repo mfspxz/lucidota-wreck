@@ -176,6 +176,35 @@ impl LocalGit {
         // via `invariants_of`; default empty here.
         Ok(view)
     }
+
+    /// Enrich a ChangeView with MEASURED symbols: for each changed file,
+    /// read the head content and extract enclosing function names for the
+    /// added line ranges via tree-sitter. Symbols stop being agent-declared
+    /// and start being observed — the structural-diff upgrade.
+    pub fn measure_symbols(
+        &self,
+        fork: &Path,
+        head: &Sha,
+        view: &mut ChangeView,
+    ) -> Result<(), String> {
+        for f in &view.files {
+            if f.added.is_empty() || !f.path.ends_with(".rs") {
+                continue;
+            }
+            let content = git(fork, &["show", &format!("{}:{}", head.as_str(), f.path)])
+                .unwrap_or_default();
+            if content.is_empty() {
+                continue;
+            }
+            for sym in wreck_graph::enclosing_functions(&content, &f.added) {
+                if !view.symbols.contains(&sym) {
+                    view.symbols.push(sym);
+                }
+            }
+        }
+        view.symbols.sort();
+        Ok(())
+    }
 }
 
 /// MergePort over local git: single-writer merge into baseline main.
