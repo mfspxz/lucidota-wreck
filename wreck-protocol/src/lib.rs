@@ -197,7 +197,10 @@ impl ChangeClaim {
     /// The claim rides the push event's commit message — the Worker's
     /// claimFromCommit parses it with zero extra subrequests.
     pub fn to_trailer(&self) -> String {
-        format!("Wreck-Claim: {}", serde_json::to_string(self).unwrap_or_default())
+        format!(
+            "Wreck-Claim: {}",
+            serde_json::to_string(self).unwrap_or_default()
+        )
     }
 
     /// Parse the first `Wreck-Claim:` trailer from a commit message.
@@ -241,6 +244,15 @@ pub enum Verdict {
     Blocked { by: Vec<String> },
 }
 
+/// The merge outcome. Sealed INTO the decision record before sealing —
+/// never bolted onto the receipt afterwards (that would invalidate the
+/// payload_hash/seal; see the stale-hash guard in DecisionRecord::seal).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeRecord {
+    pub merge_sha: Sha,
+    pub port: String,
+}
+
 /// A conflict discovered by the change graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictRef {
@@ -282,6 +294,11 @@ pub struct DecisionRecord {
     pub decision_hash: String,
     /// seal of the previous decision record: the hash chain.
     pub parent_decision: String,
+    /// Merge outcome (sha + port). Present only on accepted+merged
+    /// decisions; part of the hashed canonical value, so it is sealed
+    /// with the decision — never added to the receipt post-seal.
+    #[serde(default)]
+    pub merge: Option<MergeRecord>,
     /// `lucidota-receipt/1` envelope sealing this decision.
     pub receipt: Map<String, Value>,
 }
@@ -314,10 +331,23 @@ impl DecisionRecord {
             policy,
             decision_hash: String::new(),
             parent_decision: parent_decision.to_string(),
+            merge: None,
             receipt: Map::new(),
         };
         rec.decision_hash = rec.compute_hash()?;
         Ok(rec)
+    }
+
+    /// Attach the merge outcome BEFORE sealing. Re-hashes, because the
+    /// merge is part of the decision: sealing a hash computed without it
+    /// would leave the receipt lying about what was sealed.
+    pub fn with_merge(mut self, merge_sha: Sha, port: &str) -> Result<Self, String> {
+        self.merge = Some(MergeRecord {
+            merge_sha,
+            port: port.to_string(),
+        });
+        self.decision_hash = self.compute_hash()?;
+        Ok(self)
     }
 
     fn canonical_value(&self) -> Value {
@@ -333,12 +363,20 @@ impl DecisionRecord {
         m.insert("head".into(), Value::String(self.head.as_str().into()));
         m.insert(
             "canon".into(),
-            Value::Array(self.canon.iter().map(|s| Value::String(s.clone())).collect()),
+            Value::Array(
+                self.canon
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
         );
         m.insert(
             "contracts".into(),
             Value::Array(
-                self.contracts.iter().map(|s| Value::String(s.clone())).collect(),
+                self.contracts
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
             ),
         );
         m.insert("claims_checked".into(), Value::from(self.claims_checked));
@@ -356,6 +394,10 @@ impl DecisionRecord {
             "parent_decision".into(),
             Value::String(self.parent_decision.clone()),
         );
+        m.insert(
+            "merge".into(),
+            serde_json::to_value(&self.merge).unwrap_or(Value::Null),
+        );
         Value::Object(m)
     }
 
@@ -367,14 +409,19 @@ impl DecisionRecord {
     /// Seal the decision into a `lucidota-receipt/1` envelope.
     /// `status` is the envelope vocabulary: "claimed" | "established" | "authorized".
     /// An ACCEPT verdict seals as "established"; anything else as "claimed".
-    pub fn seal(
-        &mut self,
-        key: &[u8],
-        actor: &str,
-        ts: &str,
-    ) -> Result<(), String> {
+    ///
+    /// Fail-closed integrity (cycle-08): the stored `decision_hash` must
+    /// cover the CURRENT fields. A record mutated after hashing (the
+    /// original complete_merge bug: seal-then-mutate the receipt payload)
+    /// is refused here, before any envelope exists to invalidate.
+    pub fn seal(&mut self, key: &[u8], actor: &str, ts: &str) -> Result<(), String> {
+        let fresh = self.compute_hash()?;
         if self.decision_hash.is_empty() {
-            self.decision_hash = self.compute_hash()?;
+            self.decision_hash = fresh;
+        } else if self.decision_hash != fresh {
+            return Err(
+                "wreck-protocol: decision_hash is stale — record mutated after hashing; refusing to seal".into(),
+            );
         }
         let status = match &self.verdict {
             Verdict::Accept => "established",
@@ -410,6 +457,15 @@ impl DecisionRecord {
         }
         pl::envelope::verify(&self.receipt)
     }
+
+    /// Key-injectable receipt verification (hermetic tests; the governor
+    /// passes its own key after every seal, accepted merges included).
+    pub fn verify_receipt_with(&self, key: &[u8]) -> Result<(), String> {
+        if self.receipt.is_empty() {
+            return Err("wreck-protocol: decision is not sealed".into());
+        }
+        pl::envelope::verify_with(key, &self.receipt)
+    }
 }
 
 #[cfg(test)]
@@ -430,7 +486,8 @@ mod tests {
 
     #[test]
     fn transitions_are_forward_only() {
-        let mut c = ChangeClaim::propose("wreck-1", "a1", "t1", sha('a'), sha('b'), "test").expect("valid change_id");
+        let mut c = ChangeClaim::propose("wreck-1", "a1", "t1", sha('a'), sha('b'), "test")
+            .expect("valid change_id");
         assert!(c.transition(ChangeStatus::Observed).is_ok());
         assert!(c.transition(ChangeStatus::Proposed).is_err()); // backward
         assert!(c.transition(ChangeStatus::Proven).is_err()); // skip
@@ -441,7 +498,8 @@ mod tests {
 
     #[test]
     fn happy_path_to_merged() {
-        let mut c = ChangeClaim::propose("wreck-2", "a1", "t1", sha('a'), sha('b'), "test").expect("valid change_id");
+        let mut c = ChangeClaim::propose("wreck-2", "a1", "t1", sha('a'), sha('b'), "test")
+            .expect("valid change_id");
         for s in [
             ChangeStatus::Observed,
             ChangeStatus::Checked,
@@ -457,7 +515,8 @@ mod tests {
     #[test]
     fn decision_hash_is_deterministic() {
         let mk = || {
-            let c = ChangeClaim::propose("wreck-3", "a1", "t1", sha('a'), sha('b'), "x").expect("valid change_id");
+            let c = ChangeClaim::propose("wreck-3", "a1", "t1", sha('a'), sha('b'), "x")
+                .expect("valid change_id");
             DecisionRecord::draft(
                 &c,
                 Verdict::Accept,
@@ -467,7 +526,10 @@ mod tests {
                 7,
                 14,
                 vec![],
-                PolicyResult { pass: true, rule: "default-allow".into() },
+                PolicyResult {
+                    pass: true,
+                    rule: "default-allow".into(),
+                },
                 "GENESIS",
             )
             .unwrap()
@@ -481,7 +543,8 @@ mod tests {
     #[test]
     fn seal_and_verify_roundtrip() {
         let key = b"test-authority-key-32-bytes-long!!!!";
-        let c = ChangeClaim::propose("wreck-4", "a1", "t1", sha('a'), sha('b'), "x").expect("valid change_id");
+        let c = ChangeClaim::propose("wreck-4", "a1", "t1", sha('a'), sha('b'), "x")
+            .expect("valid change_id");
         let mut d = DecisionRecord::draft(
             &c,
             Verdict::Accept,
@@ -491,45 +554,72 @@ mod tests {
             1,
             1,
             vec![],
-            PolicyResult { pass: true, rule: "r".into() },
+            PolicyResult {
+                pass: true,
+                rule: "r".into(),
+            },
             "GENESIS",
         )
         .unwrap();
         // wrap_with signs with the given key; verify checks against the
         // authority key file, so verify the envelope structurally here via
         // the chain verifier shape instead: seal must populate receipt.
-        d.seal(key, "governor-test", "2026-10-08T21:00:00Z").unwrap();
-        assert_eq!(d.receipt.get("env").and_then(|v| v.as_str()), Some("lucidota-receipt/1"));
-        assert_eq!(d.receipt.get("status").and_then(|v| v.as_str()), Some("established"));
+        d.seal(key, "governor-test", "2026-10-08T21:00:00Z")
+            .unwrap();
+        assert_eq!(
+            d.receipt.get("env").and_then(|v| v.as_str()),
+            Some("lucidota-receipt/1")
+        );
+        assert_eq!(
+            d.receipt.get("status").and_then(|v| v.as_str()),
+            Some("established")
+        );
         assert_eq!(
             d.receipt.get("prev_hash").and_then(|v| v.as_str()),
             Some("GENESIS")
         );
         // chain verification over two decisions
-        let seal1 = d.receipt.get("seal").and_then(|v| v.as_str()).unwrap().to_string();
-        let c2 = ChangeClaim::propose("wreck-5", "a2", "t1", sha('b'), sha('c'), "y").expect("valid change_id");
+        let seal1 = d
+            .receipt
+            .get("seal")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        let c2 = ChangeClaim::propose("wreck-5", "a2", "t1", sha('b'), sha('c'), "y")
+            .expect("valid change_id");
         let mut d2 = DecisionRecord::draft(
             &c2,
-            Verdict::Reject { reason: "policy".into(), rule: "CANON-31".into() },
+            Verdict::Reject {
+                reason: "policy".into(),
+                rule: "CANON-31".into(),
+            },
             vec![],
             vec![],
             0,
             0,
             0,
             vec![],
-            PolicyResult { pass: false, rule: "CANON-31".into() },
+            PolicyResult {
+                pass: false,
+                rule: "CANON-31".into(),
+            },
             &seal1,
         )
         .unwrap();
-        d2.seal(key, "governor-test", "2026-10-08T21:01:00Z").unwrap();
-        assert_eq!(d2.receipt.get("status").and_then(|v| v.as_str()), Some("claimed"));
+        d2.seal(key, "governor-test", "2026-10-08T21:01:00Z")
+            .unwrap();
+        assert_eq!(
+            d2.receipt.get("status").and_then(|v| v.as_str()),
+            Some("claimed")
+        );
         // verify_chain_with with the same key proves the chain is intact
         pl::envelope::verify_chain_with(key, &[d.receipt.clone(), d2.receipt.clone()]).unwrap();
     }
 
     #[test]
     fn reject_reachable_past_proposed_only() {
-        let mut c = ChangeClaim::propose("wreck-6", "a1", "t1", sha('a'), sha('b'), "x").expect("valid change_id");
+        let mut c = ChangeClaim::propose("wreck-6", "a1", "t1", sha('a'), sha('b'), "x")
+            .expect("valid change_id");
         assert!(c.transition(ChangeStatus::Rejected).is_err()); // not from Proposed
         c.transition(ChangeStatus::Observed).unwrap();
         c.transition(ChangeStatus::Rejected).unwrap(); // legal from Observed
@@ -537,8 +627,18 @@ mod tests {
 
     #[test]
     fn schema_json_roundtrip() {
-        let mut c = ChangeClaim::propose("wreck-7", "agent-a", "task-42", sha('a'), sha('b'), "improve auth timeout").expect("valid change_id");
-        c.scope.push(ScopeItem::File { path: "src/auth.rs".into() });
+        let mut c = ChangeClaim::propose(
+            "wreck-7",
+            "agent-a",
+            "task-42",
+            sha('a'),
+            sha('b'),
+            "improve auth timeout",
+        )
+        .expect("valid change_id");
+        c.scope.push(ScopeItem::File {
+            path: "src/auth.rs".into(),
+        });
         c.claims.push(Claim {
             id: "C1".into(),
             statement: "preserves public API".into(),
@@ -564,12 +664,17 @@ mod trailer_tests {
     #[test]
     fn trailer_roundtrip() {
         let mut c = ChangeClaim::propose(
-            "wreck-t", "a1", "t1",
+            "wreck-t",
+            "a1",
+            "t1",
             Sha::new(&"a".repeat(40)).unwrap(),
             Sha::new(&"b".repeat(40)).unwrap(),
             "do the thing",
-        ).expect("valid change_id");
-        c.scope.push(ScopeItem::File { path: "src/x.rs".into() });
+        )
+        .expect("valid change_id");
+        c.scope.push(ScopeItem::File {
+            path: "src/x.rs".into(),
+        });
         let msg = format!("do the thing\n\n{}", c.to_trailer());
         let back = ChangeClaim::from_trailer(&msg).unwrap();
         assert_eq!(back.change_id, "wreck-t");
@@ -608,7 +713,15 @@ mod trailer_tests {
 
     #[test]
     fn change_id_rejects_injection_and_bad_lengths() {
-        for id in ["", "x", "a\nb: injected", "a b", "a;b", "a$b", &"a".repeat(64)] {
+        for id in [
+            "",
+            "x",
+            "a\nb: injected",
+            "a b",
+            "a;b",
+            "a$b",
+            &"a".repeat(64),
+        ] {
             assert!(ChangeClaim::validate_change_id(id).is_err(), "id: {:?}", id);
         }
         // 63 chars is the max (mirrors Artifacts repo-name rule)

@@ -107,6 +107,86 @@ test("C1: claimFromCommit uses normalized nested fields", () => {
   assert.ok(!claim.change_id.includes("undefined"));
 });
 
+// ---------- M4: trailer whitelist + server-derived identity ----------
+
+test("M4: trailer cannot override identity fields", () => {
+  const ev = parseEvent(officialEvent("task-9"));
+  const trailer = {
+    agent_id: "mallory",
+    change_id: "../../evil",
+    task_id: "t2",
+    status: "MERGED",
+    intent: "legit intent",
+    scope: ["src/a.rs"],
+  };
+  const after = {
+    message: `do it\n\nWreck-Claim: ${JSON.stringify(trailer)}`,
+    author: { name: "mallory" },
+  };
+  const claim = claimFromCommit(ev, after);
+  // identity is ALWAYS server-derived
+  assert.equal(claim.change_id, "task-9");
+  assert.equal(claim.agent_id, "repo:task-9");
+  assert.equal(claim.task_id, "task-9");
+  assert.equal(claim.status, "PROPOSED");
+  assert.equal(claim.base, "a".repeat(40));
+  assert.equal(claim.head, "b".repeat(40));
+  // whitelisted semantic fields ARE honored
+  assert.equal(claim.intent, "legit intent");
+  assert.deepEqual(claim.scope, ["src/a.rs"]);
+});
+
+test("M4: author.name is never used as identity", () => {
+  const ev = parseEvent(officialEvent("task-9"));
+  const claim = claimFromCommit(ev, { message: "do it", author: { name: "mallory" } });
+  assert.equal(claim.agent_id, "repo:task-9");
+});
+
+test("M4: mistyped trailer fields discard the whole trailer", () => {
+  const ev = parseEvent(officialEvent("task-9"));
+  for (const bad of [{ intent: 42 }, { scope: "not-an-array" }, { claims: { id: "x" } }, ["array"]]) {
+    const after = {
+      message: `do it\n\nWreck-Claim: ${JSON.stringify(bad)}`,
+      author: {},
+    };
+    const claim = claimFromCommit(ev, after);
+    assert.deepEqual(claim.scope, [], `trailer must be dropped: ${JSON.stringify(bad)}`);
+    assert.equal(claim.intent, "do it", `intent falls back to subject: ${JSON.stringify(bad)}`);
+  }
+});
+
+test("M4: repoName failing the change_id charset is InvalidEvent", () => {
+  const ev = {
+    type: "x",
+    source: { type: "artifacts.repo", namespace: "wreck", repoName: "../../evil" },
+    payload: { ref: "r", before: "a", after: "b" },
+  };
+  assert.throws(() => parseEvent(ev), InvalidEvent);
+});
+
+// ---------- M5: pre-merge re-check ----------
+
+test("M5: duplicate delivery after a completed merge never re-merges", async () => {
+  let merges = 0;
+  const depsFor = (mergedList) => ({
+    inFlight: async () => [],
+    merged: async () => mergedList,
+    policy: async () => ({ rules: [] }),
+    decide: () => ({ outcome: "accept_pending", draft: { change_id: "task-7" }, claim: {} }),
+    merge: async () => { merges++; return "f".repeat(40); },
+    complete: () => ({ decision: { verdict: "Accept" } }),
+    record: async () => {},
+    notify: async () => {},
+  });
+  // first delivery: not yet merged -> merge runs once
+  await handlePush(officialEvent("task-7"), mockEnv([]), null, depsFor([]));
+  assert.equal(merges, 1);
+  // second delivery: KV key "lost" (fresh env, simulating the check-then-set
+  // race), but the merged set now contains the change -> no second merge
+  await handlePush(officialEvent("task-7"), mockEnv([]), null, depsFor(["task-7"]));
+  assert.equal(merges, 1, "the duplicate delivery must not re-merge");
+});
+
 // ---------- H2: fail-closed stubs ----------
 
 test("H2: inFlightViews/mergedIds/activePolicy throw fail-closed", async () => {

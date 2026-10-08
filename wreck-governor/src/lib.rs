@@ -8,7 +8,7 @@
 //! Every verdict becomes a sealed DecisionRecord chained to its parent.
 
 use std::collections::HashSet;
-use wreck_graph::{ChangeView, Policy, classify};
+use wreck_graph::{classify, ChangeView, Policy};
 use wreck_protocol::{
     ChangeClaim, ChangeStatus, ConflictKind, ConflictRef, DecisionRecord, PolicyResult, Sha,
     Verdict,
@@ -68,15 +68,48 @@ pub struct Governor {
 
 impl Governor {
     pub fn new(policy: Policy, key: Vec<u8>, actor: &str) -> Self {
-        Governor { policy, key, actor: actor.to_string(), chain: vec!["GENESIS".to_string()] }
+        Governor {
+            policy,
+            key,
+            actor: actor.to_string(),
+            chain: vec!["GENESIS".to_string()],
+        }
+    }
+
+    /// For the WASM complete path: seed the chain at the persisted head
+    /// (D1) so seal() enforces continuity against the real head, not GENESIS.
+    /// The caller MUST supply the persisted head; see run_complete.
+    pub fn with_head(policy: Policy, key: Vec<u8>, actor: &str, head: &str) -> Self {
+        Governor {
+            policy,
+            key,
+            actor: actor.to_string(),
+            chain: vec![head.to_string()],
+        }
     }
 
     fn parent_seal(&self) -> String {
-        self.chain.last().cloned().unwrap_or_else(|| "GENESIS".to_string())
+        self.chain
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "GENESIS".to_string())
     }
 
     fn seal(&mut self, mut rec: DecisionRecord, ts: &str) -> Result<DecisionRecord, String> {
+        // M3 (cycle-06 audit): chain continuity — the record must extend
+        // the CURRENT head. A draft built on a stale head (concurrent
+        // decide, replayed event) is refused: no forks, no replays.
+        if rec.parent_decision != self.parent_seal() {
+            return Err(format!(
+                "wreck-governor: refusing to seal: parent_decision {:?} != chain head {:?} (fork or replay)",
+                rec.parent_decision,
+                self.parent_seal()
+            ));
+        }
         rec.seal(&self.key, &self.actor, ts)?;
+        // Fail-closed: every sealed decision verifies under our own key
+        // before it leaves the governor — accepted merges included.
+        rec.verify_receipt_with(&self.key)?;
         let seal = rec
             .receipt
             .get("seal")
@@ -162,24 +195,22 @@ impl Governor {
         ts: &str,
     ) -> Result<DecisionRecord, String> {
         match self.decide(change, view, in_flight, merged, ts)? {
-            DecideOutcome::AcceptPending { draft } => {
-                match merger.merge(change) {
-                    Ok(merge_sha) => {
-                        advance_to(change, ChangeStatus::Merged)?;
-                        self.complete_merge(draft, &merge_sha, merger.name(), ts)
-                    }
-                    Err(e) => {
-                        let conflicts = draft.conflicts.clone();
-                        self.reject(
-                            change,
-                            format!("merge failed: {}", e),
-                            "MERGE-FAILED".into(),
-                            conflicts,
-                            ts,
-                        )
-                    }
+            DecideOutcome::AcceptPending { draft } => match merger.merge(change) {
+                Ok(merge_sha) => {
+                    advance_to(change, ChangeStatus::Merged)?;
+                    self.complete_merge(draft, &merge_sha, merger.name(), ts)
                 }
-            }
+                Err(e) => {
+                    let conflicts = draft.conflicts.clone();
+                    self.reject(
+                        change,
+                        format!("merge failed: {}", e),
+                        "MERGE-FAILED".into(),
+                        conflicts,
+                        ts,
+                    )
+                }
+            },
             DecideOutcome::Decided(rec) => Ok(rec),
         }
     }
@@ -205,16 +236,24 @@ impl Governor {
 
         // --- CHECKED: evidence gate ---
         if let Err(reason) = Self::check_evidence(change) {
-            return Ok(DecideOutcome::Decided(
-                self.reject(change, reason, "EVIDENCE-01".to_string(), vec![], ts)?,
-            ));
+            return Ok(DecideOutcome::Decided(self.reject(
+                change,
+                reason,
+                "EVIDENCE-01".to_string(),
+                vec![],
+                ts,
+            )?));
         }
 
         // --- CHECKED: scope attestation (measured vs declared) ---
         if let Err(reason) = Self::check_scope_attestation(change, view) {
-            return Ok(DecideOutcome::Decided(
-                self.reject(change, reason, "SCOPE-01".to_string(), vec![], ts)?,
-            ));
+            return Ok(DecideOutcome::Decided(self.reject(
+                change,
+                reason,
+                "SCOPE-01".to_string(),
+                vec![],
+                ts,
+            )?));
         }
 
         // --- graph: conflicts vs in-flight + policy ---
@@ -237,8 +276,11 @@ impl Governor {
         }
         // dedup on (kind, with_change, detail)
         conflicts.sort_by(|a, b| {
-            (conflict_key(&a.kind), &a.with_change, &a.detail)
-                .cmp(&(conflict_key(&b.kind), &b.with_change, &b.detail))
+            (conflict_key(&a.kind), &a.with_change, &a.detail).cmp(&(
+                conflict_key(&b.kind),
+                &b.with_change,
+                &b.detail,
+            ))
         });
         conflicts.dedup_by(|a, b| {
             conflict_key(&a.kind) == conflict_key(&b.kind)
@@ -261,7 +303,10 @@ impl Governor {
             }
         }
 
-        let policy_fail = conflicts.iter().find(|c| c.kind == ConflictKind::Policy).cloned();
+        let policy_fail = conflicts
+            .iter()
+            .find(|c| c.kind == ConflictKind::Policy)
+            .cloned();
         let blocking: Vec<ConflictRef> = conflicts
             .iter()
             .filter(|c| c.kind == ConflictKind::Dependency)
@@ -269,9 +314,7 @@ impl Governor {
             .collect();
         let hard: Vec<ConflictRef> = conflicts
             .iter()
-            .filter(|c| {
-                c.kind == ConflictKind::Textual || c.kind == ConflictKind::Semantic
-            })
+            .filter(|c| c.kind == ConflictKind::Textual || c.kind == ConflictKind::Semantic)
             .cloned()
             .collect();
 
@@ -286,7 +329,11 @@ impl Governor {
             )?));
         }
         if !hard.is_empty() {
-            let detail = hard.iter().map(|c| c.detail.clone()).collect::<Vec<_>>().join("; ");
+            let detail = hard
+                .iter()
+                .map(|c| c.detail.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
             return Ok(DecideOutcome::Decided(self.reject(
                 change,
                 format!("conflicts: {}", detail),
@@ -310,7 +357,10 @@ impl Governor {
                 change.evidence.len() as u32,
                 0,
                 conflicts,
-                PolicyResult { pass: true, rule: "default-allow".into() },
+                PolicyResult {
+                    pass: true,
+                    rule: "default-allow".into(),
+                },
                 &self.parent_seal(),
             )?;
             return Ok(DecideOutcome::Decided(self.seal(rec, ts)?));
@@ -329,13 +379,22 @@ impl Governor {
             change.evidence.len() as u32,
             0,
             conflicts,
-            PolicyResult { pass: true, rule: "default-allow".into() },
+            PolicyResult {
+                pass: true,
+                rule: "default-allow".into(),
+            },
             &self.parent_seal(),
         )?;
         Ok(DecideOutcome::AcceptPending { draft })
     }
 
     /// Seal an accepted draft after the substrate merged it.
+    ///
+    /// The merge outcome is part of the DECISION: it is attached via
+    /// `with_merge` (which re-hashes) BEFORE sealing. The old code sealed
+    /// first and then mutated `receipt.payload`, invalidating
+    /// payload_hash and the seal — that shape is now impossible: the
+    /// stale-hash guard in DecisionRecord::seal refuses it.
     pub fn complete_merge(
         &mut self,
         draft: DecisionRecord,
@@ -343,17 +402,8 @@ impl Governor {
         port_name: &str,
         ts: &str,
     ) -> Result<DecisionRecord, String> {
-        let mut rec = self.seal(draft, ts)?;
-        if let Some(payload) = rec.receipt.get_mut("payload") {
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert(
-                    "merge_sha".into(),
-                    serde_json::Value::String(merge_sha.as_str().into()),
-                );
-                obj.insert("merge_port".into(), serde_json::Value::String(port_name.into()));
-            }
-        }
-        Ok(rec)
+        let rec = draft.with_merge(merge_sha.clone(), port_name)?;
+        self.seal(rec, ts)
     }
 
     fn reject(
@@ -377,7 +427,10 @@ impl Governor {
             change.evidence.len() as u32,
             0,
             conflicts,
-            PolicyResult { pass: false, rule: "rejected".into() },
+            PolicyResult {
+                pass: false,
+                rule: "rejected".into(),
+            },
             &self.parent_seal(),
         )?;
         self.seal(rec, ts)
@@ -414,22 +467,32 @@ mod tests {
         }
     }
 
-    fn gov() -> Governor {
-        Governor::new(policy(), b"test-key-32-bytes-long-padding!!".to_vec(), "governor-test")
+    fn gov() -> (Governor, Vec<u8>) {
+        let key = b"test-key-32-bytes-long-padding!!".to_vec();
+        (Governor::new(policy(), key.clone(), "governor-test"), key)
     }
 
     fn mk_change(id: &str, scope: Vec<ScopeItem>) -> (ChangeClaim, ChangeView) {
         let mut c = ChangeClaim::propose(
-            id, "agent-1", "task-1",
+            id,
+            "agent-1",
+            "task-1",
             Sha::new(&"a".repeat(40)).unwrap(),
             Sha::new(&"b".repeat(40)).unwrap(),
             "test",
-        ).expect("valid change_id");
+        )
+        .expect("valid change_id");
         c.scope = scope;
-        c.claims.push(Claim { id: "C1".into(), statement: "safe".into(), kind: ClaimKind::PreservesApi });
+        c.claims.push(Claim {
+            id: "C1".into(),
+            statement: "safe".into(),
+            kind: ClaimKind::PreservesApi,
+        });
         c.evidence.push(Evidence {
-            id: "C1-E1".into(), kind: EvidenceKind::Test,
-            reference: "C1: test 184".into(), digest: "sha256:abc".into(),
+            id: "C1-E1".into(),
+            kind: EvidenceKind::Test,
+            reference: "C1: test 184".into(),
+            digest: "sha256:abc".into(),
         });
         let v = ChangeView::from_scope(id, &c.scope);
         (c, v)
@@ -438,51 +501,289 @@ mod tests {
     fn file_view(id: &str, path: &str, added: Vec<(u32, u32)>) -> (ChangeClaim, ChangeView) {
         let (c, _) = mk_change(id, vec![ScopeItem::File { path: path.into() }]);
         let mut v = ChangeView::from_scope(id, &c.scope);
-        v.files = vec![FileChange { path: path.into(), added, removed: vec![] }];
+        v.files = vec![FileChange {
+            path: path.into(),
+            added,
+            removed: vec![],
+        }];
         (c, v)
     }
 
     #[test]
     fn clean_change_is_accepted_and_sealed() {
-        let mut g = gov();
+        let (mut g, key) = gov();
         let (mut c, v) = file_view("w-1", "src/foo.rs", vec![(1, 10)]);
-        let d = g.evaluate(&mut c, &v, &[], &HashSet::new(), &FakeMerger, "2026-10-08T22:00:00Z").unwrap();
+        let d = g
+            .evaluate(
+                &mut c,
+                &v,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T22:00:00Z",
+            )
+            .unwrap();
         assert!(matches!(d.verdict, Verdict::Accept));
         assert_eq!(c.status, ChangeStatus::Merged);
-        d.verify_receipt().unwrap_err(); // signed with test key, not authority file key
-        assert_eq!(d.receipt.get("status").and_then(|v| v.as_str()), Some("established"));
+        // every returned decision verifies under the injected key —
+        // accepted merges included (no more unwrap_err on file keys)
+        d.verify_receipt_with(&key)
+            .expect("accepted decision must verify");
+        assert_eq!(
+            d.receipt.get("status").and_then(|v| v.as_str()),
+            Some("established")
+        );
+        // the merge outcome is sealed INSIDE the payload, not bolted on after
+        let payload = d
+            .receipt
+            .get("payload")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            payload
+                .get("merge")
+                .and_then(|m| m.get("port"))
+                .and_then(|v| v.as_str()),
+            Some("fake")
+        );
+        assert!(payload
+            .get("merge")
+            .and_then(|m| m.get("merge_sha"))
+            .and_then(|v| v.as_str())
+            .is_some());
         assert_eq!(g.decisions_sealed(), 1);
+    }
+
+    // Cycle-08 regression: the original complete_merge bug — seal first,
+    // then mutate receipt.payload. Any post-seal mutation MUST fail
+    // verification (payload_hash + seal both cover the payload).
+    #[test]
+    fn post_seal_mutation_fails_verification() {
+        let (mut g, key) = gov();
+        let (mut c, v) = file_view("w-mut", "src/foo.rs", vec![(1, 10)]);
+        let d = g
+            .evaluate(
+                &mut c,
+                &v,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T22:00:00Z",
+            )
+            .unwrap();
+        d.verify_receipt_with(&key).unwrap();
+        // attacker adds merge_sha to the sealed payload, exactly as the
+        // old complete_merge did
+        let mut evil = d.clone();
+        evil.receipt
+            .get_mut("payload")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "merge_sha".into(),
+                serde_json::Value::String("f".repeat(40)),
+            );
+        let err = evil.verify_receipt_with(&key).unwrap_err();
+        assert!(
+            err.contains("tampered") || err.contains("mismatch"),
+            "unexpected error: {}",
+            err
+        );
+        // the pristine record still verifies
+        d.verify_receipt_with(&key).unwrap();
+    }
+
+    // Cycle-08 regression: a record mutated after hashing must be refused
+    // AT SEAL TIME, before any envelope exists to invalidate.
+    #[test]
+    fn stale_hash_refused_at_seal() {
+        let c = ChangeClaim::propose(
+            "w-stale",
+            "a",
+            "t",
+            Sha::new(&"a".repeat(40)).unwrap(),
+            Sha::new(&"b".repeat(40)).unwrap(),
+            "x",
+        )
+        .expect("valid change_id");
+        let mut rec = DecisionRecord::draft(
+            &c,
+            Verdict::Accept,
+            vec![],
+            vec![],
+            0,
+            0,
+            0,
+            vec![],
+            PolicyResult {
+                pass: true,
+                rule: "r".into(),
+            },
+            "GENESIS",
+        )
+        .unwrap();
+        // mutate after the draft hashed (simulates the old seal-then-mutate)
+        rec.tests = 999;
+        let err = rec
+            .seal(
+                b"test-key-32-bytes-long-padding!!",
+                "g",
+                "2026-10-08T22:00:00Z",
+            )
+            .unwrap_err();
+        assert!(err.contains("stale"), "unexpected error: {}", err);
+        assert!(
+            rec.receipt.is_empty(),
+            "nothing must be sealed on stale hash"
+        );
+    }
+
+    // M3 regression: two drafts built on the same head — sealing the second
+    // after the first is a fork and must be refused.
+    #[test]
+    fn chain_fork_is_refused() {
+        let (mut g, _key) = gov();
+        let (mut c1, v1) = file_view("w-f1", "src/a.rs", vec![(1, 5)]);
+        let (mut c2, v2) = file_view("w-f2", "src/b.rs", vec![(1, 5)]);
+        // both decide against the GENESIS head
+        let d1 = match g
+            .decide(&mut c1, &v1, &[], &HashSet::new(), "2026-10-08T22:00:00Z")
+            .unwrap()
+        {
+            DecideOutcome::AcceptPending { draft } => draft,
+            DecideOutcome::Decided(_) => panic!("expected accept-pending"),
+        };
+        let d2 = match g
+            .decide(&mut c2, &v2, &[], &HashSet::new(), "2026-10-08T22:01:00Z")
+            .unwrap()
+        {
+            DecideOutcome::AcceptPending { draft } => draft,
+            DecideOutcome::Decided(_) => panic!("expected accept-pending"),
+        };
+        let sha = Sha::new(&"f".repeat(40)).unwrap();
+        g.complete_merge(d1, &sha, "fake", "2026-10-08T22:02:00Z")
+            .unwrap();
+        // d2 was built on GENESIS; the head has moved on
+        let err = g
+            .complete_merge(d2, &sha, "fake", "2026-10-08T22:03:00Z")
+            .unwrap_err();
+        assert!(
+            err.contains("fork") || err.contains("replay"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(g.decisions_sealed(), 1);
+    }
+
+    // Complete chain verification with the injected key, accepted merges
+    // included: every envelope verifies and every prev_hash links.
+    #[test]
+    fn full_chain_verifies_with_injected_key() {
+        let (mut g, key) = gov();
+        let (mut c1, v1) = file_view("w-c1", "src/a.rs", vec![(1, 5)]);
+        let (mut c2, v2) = file_view("w-c2", "src/b.rs", vec![(1, 5)]);
+        let d1 = g
+            .evaluate(
+                &mut c1,
+                &v1,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T22:00:00Z",
+            )
+            .unwrap();
+        let d2 = g
+            .evaluate(
+                &mut c2,
+                &v2,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T22:01:00Z",
+            )
+            .unwrap();
+        d1.verify_receipt_with(&key).unwrap();
+        d2.verify_receipt_with(&key).unwrap();
+        pl::envelope::verify_chain_with(&key, &[d1.receipt.clone(), d2.receipt.clone()]).unwrap();
     }
 
     #[test]
     fn empty_evidence_is_rejected() {
-        let mut g = gov();
-        let mut c = ChangeClaim::propose("w-2", "a", "t",
-            Sha::new(&"a".repeat(40)).unwrap(), Sha::new(&"b".repeat(40)).unwrap(), "x").expect("valid change_id");
-        c.scope = vec![ScopeItem::File { path: "src/foo.rs".into() }];
-        c.claims.push(Claim { id: "C1".into(), statement: "s".into(), kind: ClaimKind::PreservesApi });
+        let (mut g, key) = gov();
+        let mut c = ChangeClaim::propose(
+            "w-2",
+            "a",
+            "t",
+            Sha::new(&"a".repeat(40)).unwrap(),
+            Sha::new(&"b".repeat(40)).unwrap(),
+            "x",
+        )
+        .expect("valid change_id");
+        c.scope = vec![ScopeItem::File {
+            path: "src/foo.rs".into(),
+        }];
+        c.claims.push(Claim {
+            id: "C1".into(),
+            statement: "s".into(),
+            kind: ClaimKind::PreservesApi,
+        });
         let v = ChangeView::from_scope("w-2", &c.scope);
-        let d = g.evaluate(&mut c, &v, &[], &HashSet::new(), &FakeMerger, "2026-10-08T22:00:00Z").unwrap();
+        let d = g
+            .evaluate(
+                &mut c,
+                &v,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T22:00:00Z",
+            )
+            .unwrap();
         assert!(matches!(d.verdict, Verdict::Reject { .. }));
         assert_eq!(c.status, ChangeStatus::Rejected);
+        d.verify_receipt_with(&key).unwrap();
     }
 
     #[test]
     fn textual_conflict_rejects() {
-        let mut g = gov();
+        let (mut g, key) = gov();
         let (mut c1, v1) = file_view("w-a", "src/auth.rs", vec![(10, 40)]);
         let (_, v2) = file_view("w-c", "src/auth.rs", vec![(30, 45)]);
-        let d = g.evaluate(&mut c1, &v1, &[v2], &HashSet::new(), &FakeMerger, "2026-10-08T22:00:00Z").unwrap();
+        let d = g
+            .evaluate(
+                &mut c1,
+                &v1,
+                &[v2],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T22:00:00Z",
+            )
+            .unwrap();
         assert!(matches!(d.verdict, Verdict::Reject { .. }));
         assert!(d.conflicts.iter().any(|c| c.kind == ConflictKind::Textual));
+        d.verify_receipt_with(&key).unwrap();
     }
 
     #[test]
     fn policy_violation_rejects_with_rule() {
-        let mut g = gov();
-        let (mut c, _) = mk_change("w-d", vec![ScopeItem::Contract { id: "auth.error-semantics".into() }]);
+        let (mut g, key) = gov();
+        let (mut c, _) = mk_change(
+            "w-d",
+            vec![ScopeItem::Contract {
+                id: "auth.error-semantics".into(),
+            }],
+        );
         let v = ChangeView::from_scope("w-d", &c.scope);
-        let d = g.evaluate(&mut c, &v, &[], &HashSet::new(), &FakeMerger, "2026-10-08T22:00:00Z").unwrap();
+        let d = g
+            .evaluate(
+                &mut c,
+                &v,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T22:00:00Z",
+            )
+            .unwrap();
         match &d.verdict {
             Verdict::Reject { reason, rule } => {
                 assert!(rule.contains("CANON-31"), "rule was {}", rule);
@@ -490,33 +791,82 @@ mod tests {
             }
             v => panic!("expected Reject, got {:?}", v),
         }
+        d.verify_receipt_with(&key).unwrap();
     }
 
     #[test]
     fn dependency_blocks_without_rejecting() {
-        let mut g = gov();
-        let (mut c, _) = mk_change("w-e", vec![ScopeItem::File { path: "tests/x.rs".into() }]);
+        let (mut g, key) = gov();
+        let (mut c, _) = mk_change(
+            "w-e",
+            vec![ScopeItem::File {
+                path: "tests/x.rs".into(),
+            }],
+        );
         let mut v = ChangeView::from_scope("w-e", &c.scope);
         v.dependencies = vec!["w-a".into()];
-        let d = g.evaluate(&mut c, &v, &[], &HashSet::new(), &FakeMerger, "2026-10-08T22:00:00Z").unwrap();
+        let d = g
+            .evaluate(
+                &mut c,
+                &v,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T22:00:00Z",
+            )
+            .unwrap();
         assert!(matches!(d.verdict, Verdict::Blocked { .. }));
         assert_eq!(c.status, ChangeStatus::Proven); // not terminal: waits
-        // now merge the dependency and re-run: accepted
+                                                    // now merge the dependency and re-run: accepted
         let mut merged = HashSet::new();
         merged.insert("w-a".into());
-        let d2 = g.evaluate(&mut c, &v, &[], &merged, &FakeMerger, "2026-10-08T22:01:00Z").unwrap();
+        let d2 = g
+            .evaluate(
+                &mut c,
+                &v,
+                &[],
+                &merged,
+                &FakeMerger,
+                "2026-10-08T22:01:00Z",
+            )
+            .unwrap();
         assert!(matches!(d2.verdict, Verdict::Accept));
+        d.verify_receipt_with(&key).unwrap();
+        d2.verify_receipt_with(&key).unwrap();
     }
 
     #[test]
     fn decisions_chain() {
-        let mut g = gov();
+        let (mut g, key) = gov();
         let (mut c1, v1) = file_view("w-1", "src/a.rs", vec![(1, 5)]);
         let (mut c2, v2) = file_view("w-2", "src/b.rs", vec![(1, 5)]);
-        let d1 = g.evaluate(&mut c1, &v1, &[], &HashSet::new(), &FakeMerger, "2026-10-08T22:00:00Z").unwrap();
-        let d2 = g.evaluate(&mut c2, &v2, &[], &HashSet::new(), &FakeMerger, "2026-10-08T22:01:00Z").unwrap();
+        let d1 = g
+            .evaluate(
+                &mut c1,
+                &v1,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T22:00:00Z",
+            )
+            .unwrap();
+        let d2 = g
+            .evaluate(
+                &mut c2,
+                &v2,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T22:01:00Z",
+            )
+            .unwrap();
+        d1.verify_receipt_with(&key).unwrap();
+        d2.verify_receipt_with(&key).unwrap();
         let s1 = d1.receipt.get("seal").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(d2.receipt.get("prev_hash").and_then(|v| v.as_str()), Some(s1));
+        assert_eq!(
+            d2.receipt.get("prev_hash").and_then(|v| v.as_str()),
+            Some(s1)
+        );
         assert_eq!(g.decisions_sealed(), 2);
     }
 }
@@ -539,30 +889,60 @@ mod attestation_tests {
 
     #[test]
     fn hidden_file_is_rejected() {
-        let mut gov = Governor::new(Policy::default(), b"test-key-32-bytes-long-padding!!".to_vec(), "g");
+        let mut gov = Governor::new(
+            Policy::default(),
+            b"test-key-32-bytes-long-padding!!".to_vec(),
+            "g",
+        );
         // agent declares only src/a.rs but the diff touches src/evil.rs
         let mut c = ChangeClaim::propose(
-            "w-sneaky", "agent-x", "t1",
+            "w-sneaky",
+            "agent-x",
+            "t1",
             Sha::new(&"a".repeat(40)).unwrap(),
             Sha::new(&"b".repeat(40)).unwrap(),
             "innocent refactor",
-        ).expect("valid change_id");
-        c.scope = vec![ScopeItem::File { path: "src/a.rs".into() }];
-        c.claims.push(Claim { id: "C1".into(), statement: "s".into(), kind: ClaimKind::PreservesApi });
+        )
+        .expect("valid change_id");
+        c.scope = vec![ScopeItem::File {
+            path: "src/a.rs".into(),
+        }];
+        c.claims.push(Claim {
+            id: "C1".into(),
+            statement: "s".into(),
+            kind: ClaimKind::PreservesApi,
+        });
         c.evidence.push(Evidence {
-            id: "C1-E1".into(), kind: EvidenceKind::Test,
-            reference: "C1: t".into(), digest: "sha256:x".into(),
+            id: "C1-E1".into(),
+            kind: EvidenceKind::Test,
+            reference: "C1: t".into(),
+            digest: "sha256:x".into(),
         });
         let v = ChangeView {
             change_id: "w-sneaky".into(),
             files: vec![
-                FileChange { path: "src/a.rs".into(), added: vec![(1, 2)], removed: vec![] },
-                FileChange { path: "src/evil.rs".into(), added: vec![(1, 50)], removed: vec![] },
+                FileChange {
+                    path: "src/a.rs".into(),
+                    added: vec![(1, 2)],
+                    removed: vec![],
+                },
+                FileChange {
+                    path: "src/evil.rs".into(),
+                    added: vec![(1, 50)],
+                    removed: vec![],
+                },
             ],
             ..Default::default()
         };
         let d = gov
-            .evaluate(&mut c, &v, &[], &std::collections::HashSet::new(), &FakeMerger, "2026-10-08T23:00:00Z")
+            .evaluate(
+                &mut c,
+                &v,
+                &[],
+                &std::collections::HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T23:00:00Z",
+            )
             .unwrap();
         match &d.verdict {
             Verdict::Reject { reason, rule } => {

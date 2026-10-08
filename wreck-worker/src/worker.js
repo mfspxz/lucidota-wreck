@@ -45,13 +45,41 @@ async function getWasm() {
   return wasm;
 }
 
-function callWasm(fn, inputObj, outCap = 65536) {
+/**
+ * M6 (cycle-06 audit): per-call allocation via the WASM module's own
+ * wreck_alloc/wreck_free — no fixed regions, no cross-call aliasing.
+ * Buffers are freed after every call (success or failure). A null alloc
+ * or a missing export fails closed: the call never proceeds.
+ */
+function callWasm(w, fn, inputObj, outCap = 65536) {
   const input = new TextEncoder().encode(JSON.stringify(inputObj));
   // cap before the WASM boundary: 1 MiB, reject-never-truncate
   checkCap(input.length, WASM_INPUT_CAP, `wasm ${fn} input`);
-  const inPtr = 0; // NOTE: real impl needs an allocator export; scaffold uses fixed regions
-  // ---- TODO(hardening): export wreck_alloc from the wasm module instead ----
-  throw new Error("scaffold: wire the wasm allocator before deploy");
+  if (!w.wreck_alloc || !w.wreck_free) {
+    throw new Error("wreck: wreck_alloc/wreck_free not exported — refusing fixed-region I/O (M6)");
+  }
+  const inPtr = w.wreck_alloc(input.length);
+  if (!inPtr) throw new Error(`wreck: wasm alloc failed for ${fn} input (${input.length} bytes)`);
+  const outPtr = w.wreck_alloc(outCap);
+  if (!outPtr) {
+    w.wreck_free(inPtr, input.length);
+    throw new Error(`wreck: wasm alloc failed for ${fn} output (${outCap} bytes)`);
+  }
+  try {
+    // fresh view per use: memory.buffer detaches if the module grows it
+    new Uint8Array(w.memory.buffer, inPtr, input.length).set(input);
+    const rc = w[fn](inPtr, input.length, outPtr, outCap);
+    const mem = () => new Uint8Array(w.memory.buffer);
+    if (rc < 0) {
+      // error envelope is a NUL-terminated {"error":...} (see wreck-wasm call())
+      const raw = new TextDecoder().decode(mem().subarray(outPtr, outPtr + outCap));
+      throw new Error(`wreck: ${fn} failed (${rc}): ${raw.split("\0")[0]}`);
+    }
+    return JSON.parse(new TextDecoder().decode(mem().subarray(outPtr, outPtr + rc)));
+  } finally {
+    w.wreck_free(inPtr, input.length);
+    w.wreck_free(outPtr, outCap);
+  }
 }
 
 /**
@@ -122,8 +150,8 @@ async function handleMessage(msg, env, w) {
 
 async function handlePush(event, env, w, deps = {}) {
   const {
-    decide = (o) => callWasm("wreck_decide", o),
-    complete = (o) => callWasm("wreck_complete", o),
+    decide = (o) => callWasm(w, "wreck_decide", o),
+    complete = (o) => callWasm(w, "wreck_complete", o),
     merge = mergePort,
     record = recordDecision,
     notify = notifyAgent,
@@ -171,18 +199,32 @@ async function handlePush(event, env, w, deps = {}) {
     await record(env, decideOut.decision);
     await notify(env, claim, decideOut.decision);
   } else {
-    // ACCEPT pending: merge, then seal.
-    const mergeSha = await merge(env, ev, decideOut.draft);
-    const completeOut = complete({
-      draft: decideOut.draft,
-      claim: decideOut.claim,
-      merge_sha: mergeSha,
-      port: "artifacts",
-      actor: "wreck-governor",
-      ts: new Date().toISOString(),
-    });
-    await record(env, completeOut.decision);
-    await notify(env, claim, completeOut.decision);
+    // M5 (cycle-06 audit): the KV dedup gate is check-then-set — advisory
+    // only, because KV has no CAS (the Durable Object single-writer lease
+    // is the real fix, still planned). A duplicate consumer can reach this
+    // point, so re-check the merged set immediately before merging: a
+    // double-merge is impossible. Worst case is a wasted duplicate decide,
+    // never a spurious MERGE-FAILED after a real merge.
+    const mergedNow = await merged(env, ev.namespace);
+    if (!mergedNow.includes(ev.repoName)) {
+      // ACCEPT pending: merge, then seal.
+      const mergeSha = await merge(env, ev, decideOut.draft);
+      const completeOut = complete({
+        draft: decideOut.draft,
+        claim: decideOut.claim,
+        merge_sha: mergeSha,
+        port: "artifacts",
+        // M3: the persisted chain head (D1). Null until recordDecision is
+        // wired — the WASM core then self-attests (documented gap).
+        expected_parent_seal: null,
+        actor: "wreck-governor",
+        ts: new Date().toISOString(),
+      });
+      await record(env, completeOut.decision);
+      await notify(env, claim, completeOut.decision);
+    }
+    // else: another consumer already governed and merged this change —
+    // idempotent no-op; the dedup key is still written below.
   }
 
   // H3: the dedup key is written ONLY after successful processing. A crash
@@ -239,6 +281,22 @@ function diffRanges(oldText, newText) {
   return { added: [], removed: [], _todo: "line ranges" };
 }
 
+/**
+ * M4 (cycle-06 audit): the Wreck-Claim trailer is agent-controlled input.
+ * Only a whitelist of semantic fields is honored; identity fields are
+ * ALWAYS server-derived and can never be overridden by the trailer:
+ *   change_id <- repo name (charset-validated at the event boundary)
+ *   agent_id  <- "repo:<repoName>" — the repo was minted by the governor
+ *                for this task. The git author.name is unauthenticated
+ *                (adapter spec: never use for authorization) and a
+ *                trailer agent_id is self-asserted. Attribution to a real
+ *                agent identity requires the repo→agent lease map (TODO).
+ * Each whitelisted field is type-checked; any violation discards the
+ * whole trailer (the measured diff is still governed, with zero
+ * declared semantics — the documented fallback).
+ */
+const TRAILER_ALLOWLIST = ["intent", "scope", "claims", "evidence", "dependencies"];
+
 function claimFromCommit(ev, after) {
   // The claim rides the push: parse the `Wreck-Claim:` trailer from the
   // commit message (present in the push event's commits[] — zero extra reads).
@@ -252,8 +310,8 @@ function claimFromCommit(ev, after) {
   if (line) checkCap(utf8Len(line), EVENT_CAP, "Wreck-Claim trailer");
   const base = {
     change_id: ev.repoName,
-    agent_id: (after.author && after.author.name) || "unknown",
-    task_id: "unknown",
+    agent_id: `repo:${ev.repoName}`,
+    task_id: ev.repoName,
     base: ev.before,
     head: ev.after,
     intent: msg.split("\n")[0] || "",
@@ -264,12 +322,27 @@ function claimFromCommit(ev, after) {
     status: "PROPOSED",
   };
   if (!line) return base;
+  let claimed;
   try {
-    const claimed = JSON.parse(line.slice("Wreck-Claim:".length).trim());
-    return { ...base, ...claimed, base: ev.before, head: ev.after, status: "PROPOSED" };
+    claimed = JSON.parse(line.slice("Wreck-Claim:".length).trim());
   } catch {
     return base;
   }
+  if (!claimed || typeof claimed !== "object" || Array.isArray(claimed)) return base;
+  const picked = {};
+  if ("intent" in claimed) {
+    if (typeof claimed.intent !== "string") return base; // type violation: drop trailer
+    picked.intent = claimed.intent;
+  }
+  for (const f of ["scope", "claims", "evidence", "dependencies"]) {
+    if (f in claimed) {
+      if (!Array.isArray(claimed[f])) return base; // type violation: drop trailer
+      picked[f] = claimed[f];
+    }
+  }
+  // identity fields stay server-derived: anything the trailer smuggled in
+  // (change_id, agent_id, task_id, base, head, status) is ignored.
+  return { ...base, ...picked };
 }
 
 async function inFlightViews(env, namespace) {

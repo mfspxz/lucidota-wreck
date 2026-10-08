@@ -21,6 +21,10 @@ export class InvalidEvent extends Error {
  * Validate the official nested push-event shape at the boundary.
  * Returns a normalized flat record; throws InvalidEvent on any deviation
  * (missing source/payload, non-string or empty fields).
+ *
+ * M4 (cycle-06 audit): repoName doubles as the change_id downstream, so it
+ * is validated against the change_id charset here — an agent-influenced
+ * repo name must never become a filesystem or shell capability unchecked.
  */
 export function parseEvent(event) {
   const fail = (why) => {
@@ -35,6 +39,9 @@ export function parseEvent(event) {
     if (typeof src[f] !== "string" || src[f].length === 0) {
       fail(`source.${f} missing or empty`);
     }
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,62}$/.test(src.repoName)) {
+    fail(`source.repoName is not a valid change_id: ${JSON.stringify(src.repoName)}`);
   }
   for (const f of ["ref", "before", "after"]) {
     if (typeof pay[f] !== "string" || pay[f].length === 0) {

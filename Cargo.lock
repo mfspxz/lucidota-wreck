@@ -880,6 +880,7 @@ dependencies = [
 name = "wreck-governor"
 version = "0.1.0"
 dependencies = [
+ "pl",
  "serde_json",
  "wreck-graph",
  "wreck-protocol",

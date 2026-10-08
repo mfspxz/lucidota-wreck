@@ -2,8 +2,15 @@
 //!
 //! JSON-in / JSON-out ABI (no wasm-bindgen needed):
 //!   wreck_init_key(key_ptr, key_len) -> i32 (0 ok, negative on error)
+//!   wreck_alloc(size) -> *mut u8 (null on exhaustion; M6)
+//!   wreck_free(ptr, size) -> i32 (0 ok, -1 invalid; M6)
 //!   wreck_decide(in_ptr, in_len, out_ptr, out_cap) -> i32 (bytes written, or -1)
 //!   wreck_complete(in_ptr, in_len, out_ptr, out_cap) -> i32
+//!
+//! Host buffer contract (M6): allocate input/output buffers per call with
+//! wreck_alloc, free both with wreck_free (exact sizes) after the call
+//! returns. Never use fixed regions. On -1 the output buffer holds a
+//! NUL-terminated {"error":...} envelope.
 //!
 //! AUTHORITY KEY (H1, cycle-06 audit): the sealing key is installed ONCE via
 //! wreck_init_key into WASM-static memory. It NEVER crosses the JS→WASM
@@ -22,6 +29,7 @@
 //!                    "draft": DecisionRecord|null, "decision": DecisionRecord|null }
 //! Input (complete): { "draft": DecisionRecord, "claim": ChangeClaim,
 //!                     "merge_sha": "...", "port": "...",
+//!                     "expected_parent_seal": "..."|null,  // M3: D1 head
 //!                     "actor": "...", "ts": "..." }
 //! Output (complete): { "claim": ChangeClaim, "decision": DecisionRecord }
 
@@ -75,9 +83,7 @@ fn authority_key() -> Result<Vec<u8>, String> {
         .lock()
         .map_err(|_| "wreck: authority key lock poisoned".to_string())?
         .clone()
-        .ok_or_else(|| {
-            "wreck: authority key not installed — call wreck_init_key first".to_string()
-        })
+        .ok_or_else(|| "wreck: authority key not installed — call wreck_init_key first".to_string())
 }
 
 #[derive(Deserialize)]
@@ -105,6 +111,12 @@ struct CompleteInput {
     claim: ChangeClaim,
     merge_sha: String,
     port: String,
+    /// M3 (cycle-06 audit): the persisted chain head (D1). When supplied,
+    /// the draft's parent must equal it or sealing is refused (no forks).
+    /// When absent, the check is self-attested against the draft's own
+    /// parent — the Worker MUST supply the D1 head before deploy.
+    #[serde(default)]
+    expected_parent_seal: Option<String>,
     actor: String,
     ts: String,
 }
@@ -146,9 +158,14 @@ fn run_complete(input: &[u8]) -> Result<Vec<u8>, String> {
         serde_json::from_slice(input).map_err(|e| format!("complete input: {}", e))?;
     // H1: same as decide — key from static memory, never the input.
     let key = authority_key()?;
-    let mut gov = Governor::new(Policy::default(), key, &inp.actor);
-    // NOTE: the chain parent seal comes from the draft itself; the Worker's
-    // persisted chain head must match draft.parent_decision (checked by caller).
+    // M3: seed the chain at the caller-supplied head so Governor::seal
+    // enforces continuity against the persisted head. Without it the
+    // check is self-attested (documented gap until the Worker wires D1).
+    let head = inp
+        .expected_parent_seal
+        .clone()
+        .unwrap_or_else(|| inp.draft.parent_decision.clone());
+    let mut gov = Governor::with_head(Policy::default(), key, &inp.actor, &head);
     let sha = Sha::new(&inp.merge_sha)?;
     let mut claim = inp.claim;
     // claim must be at ELIGIBLE for the merge to be recorded honestly
@@ -174,7 +191,13 @@ fn check_input_cap(input_len: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn call(input_ptr: *const u8, input_len: usize, out_ptr: *mut u8, out_cap: usize, f: fn(&[u8]) -> Result<Vec<u8>, String>) -> i32 {
+fn call(
+    input_ptr: *const u8,
+    input_len: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+    f: fn(&[u8]) -> Result<Vec<u8>, String>,
+) -> i32 {
     let result = (|| -> Result<Vec<u8>, String> {
         if input_ptr.is_null() || out_ptr.is_null() {
             return Err("null pointer".into());
@@ -198,6 +221,9 @@ fn call(input_ptr: *const u8, input_len: usize, out_ptr: *mut u8, out_cap: usize
             let b = msg.as_bytes();
             if b.len() <= out_cap {
                 unsafe {
+                    // NUL-fill first: the host reads the error as a
+                    // NUL-terminated string without knowing its length.
+                    std::ptr::write_bytes(out_ptr, 0, out_cap);
                     std::ptr::copy_nonoverlapping(b.as_ptr(), out_ptr, b.len());
                 }
             }
@@ -259,6 +285,129 @@ fn uninstall_key_for_tests() {
     }
 }
 
+/// Serializes all tests that touch the process-global AUTHORITY_KEY or
+/// drain the allocator heap (M6 exhaustion test).
+#[cfg(test)]
+static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// ---------------------------------------------------------------------------
+// Minimal per-call allocator (M6, cycle-06 audit).
+//
+// ABI contract (host = the Worker):
+//   - allocate input/output buffers per call with wreck_alloc;
+//   - pass the EXACT size given to wreck_alloc back to wreck_free;
+//   - free both buffers after the call returns (success or failure);
+//   - a null return from wreck_alloc means the heap is exhausted —
+//     the call must not proceed.
+// The heap is a fixed 16 MiB Box<[u8]> (stable address: Box never moves
+// its pointee), managed as a free list with coalescing, 8-byte aligned.
+// The Worker's JS event loop is single-threaded per isolate, but the
+// Mutex makes concurrent host calls memory-safe anyway. This closes the
+// fixed-region `inPtr = 0` race: no call ever shares an input region.
+// ---------------------------------------------------------------------------
+
+const HEAP_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct FreeBlock {
+    offset: usize,
+    len: usize,
+}
+
+struct WasmHeap {
+    mem: Option<Box<[u8]>>,
+    free: Vec<FreeBlock>,
+}
+
+impl WasmHeap {
+    fn base(&mut self) -> *mut u8 {
+        if self.mem.is_none() {
+            self.mem = Some(vec![0u8; HEAP_BYTES].into_boxed_slice());
+            self.free = vec![FreeBlock {
+                offset: 0,
+                len: HEAP_BYTES,
+            }];
+        }
+        self.mem.as_mut().unwrap().as_mut_ptr()
+    }
+}
+
+static HEAP: Mutex<WasmHeap> = Mutex::new(WasmHeap {
+    mem: None,
+    free: vec![],
+});
+
+fn align8(n: usize) -> usize {
+    (n + 7) & !7
+}
+
+/// Allocate `size` bytes (8-byte aligned). Returns null on exhaustion.
+#[no_mangle]
+pub extern "C" fn wreck_alloc(size: usize) -> *mut u8 {
+    let size = align8(size.max(1));
+    let mut heap = match HEAP.lock() {
+        Ok(g) => g,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let base = heap.base();
+    // first-fit
+    let idx = match heap.free.iter().position(|b| b.len >= size) {
+        Some(i) => i,
+        None => return std::ptr::null_mut(), // exhausted: caller must not proceed
+    };
+    let block = heap.free.remove(idx);
+    if block.len > size {
+        heap.free.push(FreeBlock {
+            offset: block.offset + size,
+            len: block.len - size,
+        });
+    }
+    // SAFETY: base is a stable Box<[u8]> pointee; offset+size <= HEAP_BYTES
+    // by construction of the free list.
+    let ptr = unsafe { base.add(block.offset) };
+    // Zero the block on alloc: the JS side reads error envelopes (rc == -1)
+    // up to the first NUL byte, and stale bytes from a previous occupant
+    // must never leak across calls (key-material hygiene, cf. H1).
+    unsafe { std::ptr::write_bytes(ptr, 0, size) };
+    ptr
+}
+
+/// Free a buffer previously returned by wreck_alloc. `size` must be the
+/// exact size passed to wreck_alloc. Returns 0 on success, -1 on an
+/// invalid pointer/size (out of range) — never corrupts the free list.
+#[no_mangle]
+pub extern "C" fn wreck_free(ptr: *mut u8, size: usize) -> i32 {
+    let size = align8(size.max(1));
+    let mut heap = match HEAP.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+    if heap.mem.is_none() || ptr.is_null() {
+        return -1;
+    }
+    let base = heap.mem.as_mut().unwrap().as_mut_ptr() as usize;
+    let p = ptr as usize;
+    if p < base || p + size > base + HEAP_BYTES || p < base {
+        return -1;
+    }
+    let offset = p - base;
+    heap.free.push(FreeBlock { offset, len: size });
+    // coalesce adjacent blocks
+    heap.free.sort_by_key(|b| b.offset);
+    let mut merged: Vec<FreeBlock> = Vec::with_capacity(heap.free.len());
+    for b in heap.free.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            if last.offset + last.len == b.offset {
+                last.len += b.len;
+                continue;
+            }
+        }
+        merged.push(b);
+    }
+    heap.free = merged;
+    0
+}
+
 #[cfg(test)]
 mod cap_tests {
     use super::*;
@@ -285,13 +434,9 @@ mod cap_tests {
         // real oversized buffer: the cap fires before the slice is viewed
         let big = vec![b'x'; MAX_INPUT_BYTES + 1];
         let mut out = vec![0u8; 4096];
-        let rc = call(
-            big.as_ptr(),
-            big.len(),
-            out.as_mut_ptr(),
-            out.len(),
-            |_| Ok(b"should never run".to_vec()),
-        );
+        let rc = call(big.as_ptr(), big.len(), out.as_mut_ptr(), out.len(), |_| {
+            Ok(b"should never run".to_vec())
+        });
         assert_eq!(rc, -1);
         let msg = std::str::from_utf8(&out[..256]).unwrap();
         assert!(msg.starts_with("{\"error\":"), "out: {}", msg);
@@ -341,11 +486,208 @@ mod cap_tests {
 }
 
 #[cfg(test)]
-mod h1_key_tests {
+mod m6_alloc_tests {
     use super::*;
 
-    /// Serializes the H1 tests: they share the process-global key static.
-    static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[test]
+    fn alloc_free_roundtrip() {
+        let p = wreck_alloc(64);
+        assert!(!p.is_null());
+        // 8-byte aligned
+        assert_eq!(p as usize % 8, 0);
+        unsafe { std::ptr::write_bytes(p, 0xAB, 64) };
+        assert_eq!(wreck_free(p, 64), 0);
+    }
+
+    #[test]
+    fn alloc_reuses_freed_blocks() {
+        let a = wreck_alloc(128);
+        let b = wreck_alloc(128);
+        assert!(!a.is_null() && !b.is_null() && a != b);
+        assert_eq!(wreck_free(a, 128), 0);
+        let c = wreck_alloc(128);
+        assert!(!c.is_null());
+        // freed block reused (first-fit)
+        assert_eq!(c, a);
+        assert_eq!(wreck_free(b, 128), 0);
+        assert_eq!(wreck_free(c, 128), 0);
+    }
+
+    #[test]
+    fn alloc_exhaustion_returns_null() {
+        // drains the whole heap: serialize against other allocator tests
+        let _guard = TEST_SERIAL.lock().unwrap();
+        // drain the 16 MiB heap in 1 MiB chunks
+        let mut ptrs = vec![];
+        loop {
+            let p = wreck_alloc(1024 * 1024);
+            if p.is_null() {
+                break;
+            }
+            ptrs.push(p);
+            if ptrs.len() > 32 {
+                break; // safety: never loop forever
+            }
+        }
+        assert!(
+            ptrs.len() >= 16,
+            "heap smaller than expected: {}",
+            ptrs.len()
+        );
+        for p in ptrs {
+            assert_eq!(wreck_free(p, 1024 * 1024), 0);
+        }
+        // coalesced back: a 1 MiB alloc works again
+        let p = wreck_alloc(1024 * 1024);
+        assert!(!p.is_null());
+        assert_eq!(wreck_free(p, 1024 * 1024), 0);
+    }
+
+    #[test]
+    fn free_invalid_pointer_fails() {
+        assert_eq!(wreck_free(std::ptr::null_mut(), 64), -1);
+        let stack_var = 0u8;
+        assert_eq!(wreck_free(&stack_var as *const u8 as *mut u8, 64), -1);
+    }
+
+    #[test]
+    fn concurrent_allocs_do_not_overlap() {
+        // the fixed-region bug this replaces: two live allocations must
+        // never alias the same memory
+        let ps: Vec<*mut u8> = (0..16).map(|_| wreck_alloc(4096)).collect();
+        assert!(ps.iter().all(|p| !p.is_null()));
+        for (i, a) in ps.iter().enumerate() {
+            for b in ps.iter().skip(i + 1) {
+                let (a, b) = (*a as usize, *b as usize);
+                assert!(a + 4096 <= b || b + 4096 <= a, "overlap: {:x} {:x}", a, b);
+            }
+        }
+        for p in ps {
+            assert_eq!(wreck_free(p, 4096), 0);
+        }
+    }
+
+    #[test]
+    fn alloc_zeroes_blocks() {
+        // stale bytes from a previous occupant must never leak: the JS
+        // side reads error envelopes up to the first NUL, and key-adjacent
+        // data must not survive across calls (cf. H1).
+        let p = wreck_alloc(64);
+        assert!(!p.is_null());
+        unsafe { std::ptr::write_bytes(p, 0xAB, 64) };
+        assert_eq!(wreck_free(p, 64), 0);
+        // re-allocate (first-fit reuses the freed block): must be zeroed
+        let q = wreck_alloc(64);
+        assert!(!q.is_null());
+        let mem = unsafe { std::slice::from_raw_parts(q, 64) };
+        assert!(
+            mem.iter().all(|&b| b == 0),
+            "reused block not zeroed — stale bytes leak"
+        );
+        assert_eq!(wreck_free(q, 64), 0);
+    }
+}
+
+#[cfg(test)]
+mod m3_complete_tests {
+    use super::*;
+
+    fn complete_input_json(expected_parent_seal: Option<&str>) -> Vec<u8> {
+        let key = b"m3-test-key-32-bytes-padded!!!!!!";
+        uninstall_key_for_tests();
+        let rc = unsafe { wreck_init_key(key.as_ptr(), key.len()) };
+        assert_eq!(rc, 0);
+        // build a real accept-pending draft through the governor:
+        // claim with evidence + scope, no conflicts -> ELIGIBLE draft
+        // whose parent is GENESIS
+        let mut c = ChangeClaim::propose(
+            "w-m3",
+            "agent-1",
+            "task-1",
+            Sha::new(&"a".repeat(40)).unwrap(),
+            Sha::new(&"b".repeat(40)).unwrap(),
+            "test",
+        )
+        .expect("valid change_id");
+        c.scope.push(wreck_protocol::ScopeItem::File {
+            path: "src/x.rs".into(),
+        });
+        c.claims.push(wreck_protocol::Claim {
+            id: "C1".into(),
+            statement: "s".into(),
+            kind: wreck_protocol::ClaimKind::PreservesApi,
+        });
+        c.evidence.push(wreck_protocol::Evidence {
+            id: "C1-E1".into(),
+            kind: wreck_protocol::EvidenceKind::Test,
+            reference: "C1: t".into(),
+            digest: "sha256:x".into(),
+        });
+        let mut gov = Governor::new(Policy::default(), key.to_vec(), "test");
+        let draft = match gov
+            .decide(
+                &mut c,
+                &ChangeView::default(),
+                &[],
+                &std::collections::HashSet::new(),
+                "2026-10-08T00:00:00Z",
+            )
+            .unwrap()
+        {
+            DecideOutcome::AcceptPending { draft } => draft,
+            DecideOutcome::Decided(_) => panic!("expected accept-pending"),
+        };
+        let mut v = serde_json::json!({
+            "draft": draft,
+            "claim": c,
+            "merge_sha": "f".repeat(40),
+            "port": "test",
+            "actor": "test",
+            "ts": "2026-10-08T00:00:00Z",
+        });
+        match expected_parent_seal {
+            Some(s) => {
+                v.as_object_mut().unwrap().insert(
+                    "expected_parent_seal".into(),
+                    serde_json::Value::String(s.into()),
+                );
+            }
+            None => {
+                v.as_object_mut()
+                    .unwrap()
+                    .insert("expected_parent_seal".into(), serde_json::Value::Null);
+            }
+        }
+        serde_json::to_vec(&v).unwrap()
+    }
+
+    #[test]
+    fn complete_with_matching_head_seals() {
+        let _guard = TEST_SERIAL.lock().unwrap();
+        let input = complete_input_json(Some("GENESIS"));
+        let out = run_complete(&input).expect("complete must seal");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v["decision"]["receipt"]["seal"].is_string());
+        let merge = &v["decision"]["merge"];
+        assert_eq!(merge["port"], "test");
+    }
+
+    #[test]
+    fn complete_with_wrong_head_is_refused() {
+        let _guard = TEST_SERIAL.lock().unwrap();
+        let input = complete_input_json(Some("WRONG-HEAD"));
+        let err = run_complete(&input).unwrap_err();
+        assert!(
+            err.contains("fork") || err.contains("replay"),
+            "unexpected error: {}",
+            err
+        );
+    }
+}
+
+#[cfg(test)]
+mod h1_key_tests {
+    use super::*;
 
     fn decide_input_json(extra_key_hex: Option<&str>) -> Vec<u8> {
         let claim = ChangeClaim::propose(
@@ -438,3 +780,4 @@ mod h1_key_tests {
         assert_eq!(v["outcome"], "decided");
     }
 }
+

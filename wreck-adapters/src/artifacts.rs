@@ -21,7 +21,10 @@ use wreck_protocol::{ChangeClaim, ScopeItem, Sha};
 // ---------------------------------------------------------------------------
 
 pub fn v4_base(account_id: &str) -> String {
-    format!("https://api.cloudflare.com/client/v4/accounts/{}", account_id)
+    format!(
+        "https://api.cloudflare.com/client/v4/accounts/{}",
+        account_id
+    )
 }
 
 pub fn ns_base(account_id: &str, namespace: &str) -> String {
@@ -220,7 +223,9 @@ impl ArtifactsClient {
             .set("Authorization", &format!("Bearer {}", self.api_token))
             .send_json(body)
             .map_err(|e| format!("artifacts POST {}: {}", url, e))?;
-        let env: V4Envelope<T> = resp.into_json().map_err(|e| format!("artifacts json: {}", e))?;
+        let env: V4Envelope<T> = resp
+            .into_json()
+            .map_err(|e| format!("artifacts json: {}", e))?;
         if !env.success {
             return Err(format!("artifacts API success=false for {}", url));
         }
@@ -234,7 +239,9 @@ impl ArtifactsClient {
             .set("Authorization", &format!("Bearer {}", self.api_token))
             .call()
             .map_err(|e| format!("artifacts GET {}: {}", url, e))?;
-        let env: V4Envelope<T> = resp.into_json().map_err(|e| format!("artifacts json: {}", e))?;
+        let env: V4Envelope<T> = resp
+            .into_json()
+            .map_err(|e| format!("artifacts json: {}", e))?;
         if !env.success {
             return Err(format!("artifacts API success=false for {}", url));
         }
@@ -292,7 +299,11 @@ impl ArtifactsClient {
     }
 
     pub fn fork_repo(&self, from: &str, name: &str) -> Result<CreateRepoResult, String> {
-        let url = format!("{}/repos/{}/fork", ns_base(&self.account_id, &self.namespace), from);
+        let url = format!(
+            "{}/repos/{}/fork",
+            ns_base(&self.account_id, &self.namespace),
+            from
+        );
         // 409 while provisioning = retriable; the caller polls readiness anyway.
         self.post(
             &url,
@@ -322,42 +333,36 @@ impl ArtifactsClient {
     }
 
     pub fn revoke_token(&self, token_id: &str) -> Result<(), String> {
-        let url = format!("{}/tokens/{}", ns_base(&self.account_id, &self.namespace), token_id);
+        let url = format!(
+            "{}/tokens/{}",
+            ns_base(&self.account_id, &self.namespace),
+            token_id
+        );
         self.delete(&url)
     }
 
     pub fn delete_repo(&self, name: &str) -> Result<(), String> {
         // 202 Accepted: async delete; the name may linger briefly.
-        let url = format!("{}/repos/{}", ns_base(&self.account_id, &self.namespace), name);
+        let url = format!(
+            "{}/repos/{}",
+            ns_base(&self.account_id, &self.namespace),
+            name
+        );
         self.delete(&url)
     }
 
     /// Recursive tree walk: returns (path -> blob hash) for all blobs.
+    /// Bounded (M2): the walk refuses past MAX_TREE_DEPTH / MAX_TREE_ENTRIES.
     pub fn tree_blobs(&self, repo: &str, hash: &str) -> Result<HashMap<String, String>, String> {
-        let mut out = HashMap::new();
-        let mut stack = vec![(hash.to_string(), String::new())];
-        while let Some((h, prefix)) = stack.pop() {
+        walk_tree(hash, |h| {
             let url = format!(
                 "{}/repos/{}/tree/{}",
                 ns_base(&self.account_id, &self.namespace),
                 repo,
                 h
             );
-            let entries: Vec<TreeEntry> = self.get(&url)?;
-            for e in entries {
-                let path = if prefix.is_empty() {
-                    e.path.clone()
-                } else {
-                    format!("{}/{}", prefix, e.path)
-                };
-                if e.entry_type == "tree" {
-                    stack.push((e.hash, path));
-                } else {
-                    out.insert(path, e.hash);
-                }
-            }
-        }
-        Ok(out)
+            self.get::<Vec<TreeEntry>>(&url)
+        })
     }
 
     pub fn blob_bytes(&self, repo: &str, hash: &str) -> Result<Vec<u8>, String> {
@@ -371,19 +376,108 @@ impl ArtifactsClient {
     }
 }
 
+/// M2 (cycle-06 audit): bounds on the tree walk. A hostile tree in a
+/// compromised agent fork must not exhaust memory: fail closed past the
+/// caps, never hang, never silently truncate.
+pub const MAX_TREE_DEPTH: usize = 64;
+pub const MAX_TREE_ENTRIES: usize = 100_000;
+
+/// Pure tree walk over a fetch closure (unit-testable without network).
+fn walk_tree<F>(root: &str, fetch: F) -> Result<HashMap<String, String>, String>
+where
+    F: Fn(&str) -> Result<Vec<TreeEntry>, String>,
+{
+    let mut out = HashMap::new();
+    let mut stack = vec![(root.to_string(), String::new(), 0usize)];
+    while let Some((h, prefix, depth)) = stack.pop() {
+        if depth > MAX_TREE_DEPTH {
+            return Err(format!(
+                "artifacts: tree depth {} exceeds cap {} — refusing unbounded walk",
+                depth, MAX_TREE_DEPTH
+            ));
+        }
+        let entries = fetch(&h)?;
+        if out.len() + entries.len() > MAX_TREE_ENTRIES {
+            return Err(format!(
+                "artifacts: tree entries exceed cap {} — refusing unbounded walk",
+                MAX_TREE_ENTRIES
+            ));
+        }
+        for e in entries {
+            let path = if prefix.is_empty() {
+                e.path.clone()
+            } else {
+                format!("{}/{}", prefix, e.path)
+            };
+            if e.entry_type == "tree" {
+                stack.push((e.hash, path, depth + 1));
+            } else {
+                out.insert(path, e.hash);
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // ChangeView from (before, after): tree-walk + local line diff
 // ---------------------------------------------------------------------------
+
+/// M1 (cycle-06 audit): unique scratch dir per diff_ranges call, created
+/// 0700 with 0600 blob files. The old fixed `wreck-diff-<pid>` path let
+/// concurrent calls clobber each other (remove_dir_all + recreate races)
+/// and left blob bytes world-readable at 0644.
+fn make_diff_dir() -> Result<PathBuf, String> {
+    static DIFF_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = DIFF_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir =
+        std::env::temp_dir().join(format!("wreck-diff-{}-{}-{}", std::process::id(), nanos, n));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn write_blob_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| e.to_string())?
+        .write_all(data)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn write_blob_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    std::fs::write(path, data).map_err(|e| e.to_string())
+}
 
 /// Compute added/removed line ranges between two blob texts via git.
 /// (Shells to git --no-index: the same -U0 parser as the local adapter,
 /// one implementation of the diff semantics.)
 fn diff_ranges(old: &[u8], new: &[u8]) -> Result<(Vec<(u32, u32)>, Vec<(u32, u32)>), String> {
-    let dir = std::env::temp_dir().join(format!("wreck-diff-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("a"), old).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("b"), new).map_err(|e| e.to_string())?;
+    let dir = make_diff_dir()?;
+    write_blob_file(&dir.join("a"), old)?;
+    write_blob_file(&dir.join("b"), new)?;
     let out = std::process::Command::new("git")
         .args(["diff", "--no-index", "-U0", "a", "b"])
         .current_dir(&dir)
@@ -443,8 +537,7 @@ impl ArtifactsClient {
         let mut view = ChangeView::from_scope(change_id, scope);
         let old_tree = self.tree_blobs(repo, before.as_str())?;
         let new_tree = self.tree_blobs(repo, after.as_str())?;
-        let mut paths: Vec<String> =
-            old_tree.keys().chain(new_tree.keys()).cloned().collect();
+        let mut paths: Vec<String> = old_tree.keys().chain(new_tree.keys()).cloned().collect();
         paths.sort();
         paths.dedup();
         let mut measured: HashMap<String, FileChange> = HashMap::new();
@@ -466,12 +559,23 @@ impl ArtifactsClient {
             if old_bytes.contains(&0) || new_bytes.contains(&0) {
                 measured.insert(
                     path.clone(),
-                    FileChange { path: path.clone(), added: vec![], removed: vec![] },
+                    FileChange {
+                        path: path.clone(),
+                        added: vec![],
+                        removed: vec![],
+                    },
                 );
                 continue;
             }
             let (added, removed) = diff_ranges(&old_bytes, &new_bytes)?;
-            measured.insert(path.clone(), FileChange { path, added, removed });
+            measured.insert(
+                path.clone(),
+                FileChange {
+                    path,
+                    added,
+                    removed,
+                },
+            );
         }
         for f in view.files.iter_mut() {
             if let Some(m) = measured.remove(&f.path) {
@@ -534,22 +638,46 @@ impl wreck_governor::MergePort for ArtifactsMergePort {
         // fresh clone of baseline (shallow: we only need the tip + merge)
         let dir = self.workdir.join(format!("merge-{}", change.change_id));
         let _ = std::fs::remove_dir_all(&dir);
-        let parent = dir.parent().unwrap();
+        // L5 (cycle-06 audit): no unwrap on the workdir parent.
+        let parent = dir
+            .parent()
+            .ok_or("artifacts merge: workdir has no parent")?;
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         // NOTE: the fork head must be fetchable; the agent's fork remote is
         // derived from the change metadata in production. Here the caller
         // stages it via `stage_fork_head`.
-        self.git(parent, &["clone", "--quiet", "--depth", "1", &self.baseline_remote, dir.to_str().unwrap()], &secret)?;
+        self.git(
+            parent,
+            &[
+                "clone",
+                "--quiet",
+                "--depth",
+                "1",
+                &self.baseline_remote,
+                dir.to_str().unwrap(),
+            ],
+            &secret,
+        )?;
         let fork_remote = std::env::var(format!("WRECK_FORK_{}", change.change_id))
             .map_err(|_| "artifacts merge: fork remote not staged (WRECK_FORK_<id>)".to_string())?;
         // fetch the fork head by SHA using the AGENT's token is wrong —
         // the governor fetches via its own baseline token only if the fork
         // grants it; in production the fork is in the same namespace and
         // the governor holds a read token for it. Simplified here.
-        self.git(&dir, &["fetch", "--depth", "1", &fork_remote, change.head.as_str()], &secret)?;
         self.git(
             &dir,
-            &["merge", "--no-ff", "-m", &format!("wreck: merge {}", change.change_id), "FETCH_HEAD"],
+            &["fetch", "--depth", "1", &fork_remote, change.head.as_str()],
+            &secret,
+        )?;
+        self.git(
+            &dir,
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                &format!("wreck: merge {}", change.change_id),
+                "FETCH_HEAD",
+            ],
             &secret,
         )?;
         self.git(&dir, &["push", "origin", "main"], &secret)?;
@@ -593,7 +721,10 @@ mod tests {
             "payload": {"ref": "refs/heads/main", "before": "aaa", "after": "bbb"}
         }"#;
         let e: PushedEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(e.dedup_key(), "wreck:seen:wreck:task-0042:refs/heads/main:aaa:bbb");
+        assert_eq!(
+            e.dedup_key(),
+            "wreck:seen:wreck:task-0042:refs/heads/main:aaa:bbb"
+        );
         assert!(!e.is_baseline("baseline"));
         assert!(e.is_baseline("task-0042"));
         let mut e2 = e.clone();
@@ -603,7 +734,10 @@ mod tests {
 
     #[test]
     fn fork_payload_shape() {
-        let f = ForkRepo { name: "task-1".into(), default_branch_only: Some(true) };
+        let f = ForkRepo {
+            name: "task-1".into(),
+            default_branch_only: Some(true),
+        };
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["name"], "task-1");
         assert_eq!(v["default_branch_only"], true);
@@ -635,5 +769,103 @@ mod tests {
         assert!(!dbg.contains("SUPERSECRET"), "leaked: {}", dbg);
         assert!(dbg.contains("<redacted>"), "missing marker: {}", dbg);
         assert!(dbg.contains("id-1"), "id lost: {}", dbg);
+    }
+
+    // M1 regression: scratch dirs are unique per call and 0700.
+    #[test]
+    fn diff_dirs_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let d = make_diff_dir().unwrap();
+            assert!(seen.insert(d.clone()), "duplicate dir: {:?}", d);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diff_dir_is_0700() {
+        use std::os::unix::fs::MetadataExt;
+        let d = make_diff_dir().unwrap();
+        let mode = std::fs::metadata(&d).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o700, "dir mode: {:o}", mode);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // M1 regression: concurrent diff_ranges calls must not clobber each
+    // other (the old fixed per-PID path corrupted results under threads).
+    #[test]
+    fn diff_ranges_is_thread_safe() {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let old = format!("line{}\n", i).into_bytes();
+                    let new = format!("line{}\nline{}\n", i, i + 100).into_bytes();
+                    diff_ranges(&old, &new).unwrap()
+                })
+            })
+            .collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            let (added, removed) = h.join().unwrap();
+            // new file gained line 2; nothing removed
+            assert_eq!(added, vec![(2, 2)], "thread {}: {:?}", i, added);
+            assert!(removed.is_empty(), "thread {}: {:?}", i, removed);
+        }
+    }
+
+    // M2 regression: the tree walk refuses hostile shapes, fail-closed.
+    fn tree_entry(name: &str, entry_type: &str, hash: &str) -> TreeEntry {
+        TreeEntry {
+            name: name.into(),
+            entry_type: entry_type.into(),
+            hash: hash.into(),
+            path: name.into(),
+        }
+    }
+
+    #[test]
+    fn walk_tree_rejects_deep_chains() {
+        // 70 nested single-child trees: exceeds MAX_TREE_DEPTH (64)
+        let fetch = |h: &str| -> Result<Vec<TreeEntry>, String> {
+            let depth: usize = h.parse().unwrap();
+            if depth >= 70 {
+                return Ok(vec![]);
+            }
+            Ok(vec![tree_entry("child", "tree", &(depth + 1).to_string())])
+        };
+        let err = walk_tree("0", fetch).unwrap_err();
+        assert!(err.contains("depth"), "err: {}", err);
+        assert!(err.contains("refusing"), "err: {}", err);
+    }
+
+    #[test]
+    fn walk_tree_rejects_entry_flood() {
+        // one directory with more blobs than the entry cap
+        let fetch = |_h: &str| -> Result<Vec<TreeEntry>, String> {
+            Ok((0..MAX_TREE_ENTRIES + 1)
+                .map(|i| tree_entry(&format!("f{}", i), "blob", "h"))
+                .collect())
+        };
+        let err = walk_tree("root", fetch).unwrap_err();
+        assert!(err.contains("entries"), "err: {}", err);
+        assert!(err.contains("refusing"), "err: {}", err);
+    }
+
+    #[test]
+    fn walk_tree_accepts_normal_trees() {
+        let fetch = |h: &str| -> Result<Vec<TreeEntry>, String> {
+            match h {
+                "root" => Ok(vec![
+                    tree_entry("a.txt", "blob", "ha"),
+                    tree_entry("sub", "tree", "sub"),
+                ]),
+                "sub" => Ok(vec![tree_entry("b.txt", "blob", "hb")]),
+                _ => Ok(vec![]),
+            }
+        };
+        let m = walk_tree("root", fetch).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m["a.txt"], "ha");
+        assert_eq!(m["sub/b.txt"], "hb");
     }
 }
