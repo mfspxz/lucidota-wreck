@@ -14,10 +14,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use wreck_adapters::{LocalGit, LocalMergePort};
 use wreck_governor::Governor;
-use wreck_graph::{ChangeView, Policy, PolicyRule};
+use wreck_graph::ChangeView;
 use wreck_protocol::{
-    ChangeClaim, Claim, ClaimKind, Evidence, EvidenceKind, ScopeItem, Sha, Verdict,
+    ChangeClaim, Claim, ClaimKind, DecisionRecord, Evidence, EvidenceKind, ScopeItem, Sha, Verdict,
 };
+
+mod dashboard;
 
 fn auth_baseline() -> Vec<String> {
     let mut lines: Vec<String> = vec![];
@@ -203,21 +205,19 @@ fn main() {
     }
 
     // ---- governor: arrival order, each checked against all previous ----
-    let policy = Policy {
-        rules: vec![PolicyRule {
-            id: "CANON-31".into(),
-            forbidden_contract: "auth.error-semantics".into(),
-            reason: "contract C-17 prohibits mutation of auth error semantics".into(),
-        }],
-    };
+    // Policy derives from CANON: the rules carry their own WHY.
+    let canon = wreck_canon::demo_canon();
+    let policy = canon.to_policy();
+    println!("canon rules active: {}", canon.active().len());
     let mut gov = Governor::new(policy, b"demo-authority-key-32bytes-padded!".to_vec(), "governor");
     let port = LocalMergePort { baseline: git.baseline_path(), forks };
     let mut merged: HashSet<String> = HashSet::new();
     let mut seen: Vec<ChangeView> = vec![];
 
     println!("\n+=========== CHANGE FIELD ===========+");
-    let mut stats = (0, 0, 0); // accepted, rejected, blocked
-    for (claim, view) in claims.iter_mut().zip(views.iter()) {
+    let mut stats = (0usize, 0usize, 0usize); // accepted, rejected, blocked
+    let mut decisions: Vec<Option<DecisionRecord>> = vec![None; claims.len()];
+    for (idx, (claim, view)) in claims.iter_mut().zip(views.iter()).enumerate() {
         // re-evaluate blocked claims after each merge (dependency may clear)
         let ts = "2026-10-08T21:30:00Z";
         let d = gov.evaluate(claim, view, &seen, &merged, &port, ts).expect("evaluate");
@@ -240,10 +240,11 @@ fn main() {
                 println!("  {:<10} REBASE   onto {}   seal {}", claim.agent_id, &onto[..12.min(onto.len())], seal);
             }
         }
+        decisions[idx] = Some(d);
         seen.push(view.clone());
     }
     // second pass: retry anything still blocked (E waits on A)
-    for (claim, view) in claims.iter_mut().zip(views.iter()) {
+    for (idx, (claim, view)) in claims.iter_mut().zip(views.iter()).enumerate() {
         if !matches!(claim.status, wreck_protocol::ChangeStatus::Proven) {
             continue;
         }
@@ -258,6 +259,7 @@ fn main() {
             }
             other => println!("  {:<10} still {:?} seal {}", claim.agent_id, other, seal),
         }
+        decisions[idx] = Some(d);
     }
     println!("+====================================+");
     println!("\n  5 agents  |  5 changes  |  {} accepted  |  {} rejected  |  {} blocked", stats.0, stats.1, stats.2);
@@ -266,12 +268,63 @@ fn main() {
 
     // ---- verify the baseline actually contains A, B, E and not C, D ----
     let final_head = git.baseline_path();
-    let log = std::process::Command::new("git")
+    let log_out = std::process::Command::new("git")
         .args(["log", "--oneline"])
         .current_dir(&final_head)
         .output()
         .unwrap();
-    println!("\nbaseline log:\n{}", String::from_utf8_lossy(&log.stdout));
+    let log_str = String::from_utf8_lossy(&log_out.stdout).to_string();
+    println!("\nbaseline log:\n{}", log_str);
+
+    // ---- dashboard ----
+    let rows: Vec<dashboard::Row> = claims
+        .iter()
+        .zip(views.iter())
+        .zip(decisions.iter())
+        .map(|((claim, view), d)| {
+            let d = d.as_ref().expect("decision per claim");
+            let (verdict, badge_class, detail) = match &d.verdict {
+                Verdict::Accept => ("ACCEPT".to_string(), "accept".to_string(), "all checks passed".to_string()),
+                Verdict::Reject { reason, rule } => {
+                    ("REJECT".to_string(), "reject".to_string(), format!("[{}] {}", rule, short(reason)))
+                }
+                Verdict::Blocked { by } => {
+                    ("BLOCKED".to_string(), "blocked".to_string(), format!("waiting on {:?}", by))
+                }
+                Verdict::NeedsRebase { onto } => {
+                    ("REBASE".to_string(), "blocked".to_string(), format!("onto {}", &onto[..12.min(onto.len())]))
+                }
+            };
+            dashboard::Row {
+                agent: claim.agent_id.clone(),
+                change_id: claim.change_id.clone(),
+                verdict,
+                badge_class,
+                detail,
+                conflicts: d.conflicts.iter().map(|c| format!("[{:?}] {}", c.kind, c.detail)).collect(),
+                seal: d.receipt.get("seal").and_then(|v| v.as_str()).unwrap_or("?")[..12].to_string(),
+                status: format!("{:?}", claim.status),
+                files: view.files.iter().map(|f| f.path.clone()).collect(),
+                invariants: view.invariants.clone(),
+            }
+        })
+        .collect();
+    let html = dashboard::render(
+        "task-auth-001 — improve authentication",
+        &rows,
+        &dashboard::Stats {
+            agents: 5,
+            changes: claims.len(),
+            accepted: stats.0,
+            rejected: stats.1,
+            blocked: stats.2,
+            sealed: gov.decisions_sealed(),
+        },
+        &log_str,
+    );
+    let dash_path = root.join("dashboard.html");
+    std::fs::write(&dash_path, html).expect("write dashboard");
+    println!("\ndashboard: {}", dash_path.display());
 
     // ---- assertions: the demo contract ----
     let status = |id: &str| claims.iter().find(|c| c.change_id == id).unwrap().status;

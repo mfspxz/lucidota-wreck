@@ -10,11 +10,12 @@
 //! never an LLM oracle.
 
 use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
 use wreck_protocol::{ConflictKind, ConflictRef, ScopeItem};
 
 /// One file's changed line ranges, in the *new* (head) revision numbering
 /// for added lines and the *base* numbering for removed lines.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChange {
     pub path: String,
     pub added: Vec<(u32, u32)>,   // inclusive ranges, head numbering
@@ -43,7 +44,7 @@ fn ranges_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
 
 /// The adapter-facing view of one change: what it touches, what it claims,
 /// what it needs. Built by the substrate adapter from (base, head).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChangeView {
     pub change_id: String,
     pub files: Vec<FileChange>,
@@ -73,14 +74,14 @@ impl ChangeView {
 }
 
 /// A policy rule: a scope pattern no change may touch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRule {
     pub id: String,
     pub forbidden_contract: String,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Policy {
     pub rules: Vec<PolicyRule>,
 }

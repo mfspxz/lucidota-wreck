@@ -1,0 +1,13 @@
+name = "wreck-governor"
+main = "src/worker.js"
+compatibility_date = "2026-10-08"
+
+[[queues.consumers]]
+queue = "wreck-push-events"
+max_batch_size = 10
+max_retries = 5
+
+# bindings (wired at deploy; names must match worker.js env usage):
+# [[kv_namespaces]]      GOVERNOR_KV
+# [[d1_databases]]       CHAIN_D1
+# [vars]                 ARTIFACTS binding via [artifacts] when available

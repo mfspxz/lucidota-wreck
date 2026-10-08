@@ -12,4 +12,5 @@ wreck-protocol = { path = "../wreck-protocol" }
 wreck-graph = { path = "../wreck-graph" }
 wreck-governor = { path = "../wreck-governor" }
 wreck-adapters = { path = "../wreck-adapters" }
+wreck-canon = { path = "../wreck-canon" }
 serde_json = "1"

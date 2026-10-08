@@ -21,6 +21,16 @@ pub trait MergePort {
     fn name(&self) -> &str;
 }
 
+/// Outcome of a merge-free decision (the WASM boundary).
+/// AcceptPending: the claim is ELIGIBLE; the caller merges via its
+/// substrate port, then calls complete_merge. Decided: already sealed
+/// (Reject or Blocked).
+#[derive(Debug)]
+pub enum DecideOutcome {
+    AcceptPending { draft: DecisionRecord },
+    Decided(DecisionRecord),
+}
+
 fn conflict_key(k: &ConflictKind) -> &'static str {
     match k {
         ConflictKind::Textual => "textual",
@@ -122,6 +132,40 @@ impl Governor {
         merger: &dyn MergePort,
         ts: &str,
     ) -> Result<DecisionRecord, String> {
+        match self.decide(change, view, in_flight, merged, ts)? {
+            DecideOutcome::AcceptPending { draft } => {
+                match merger.merge(change) {
+                    Ok(merge_sha) => {
+                        advance_to(change, ChangeStatus::Merged)?;
+                        self.complete_merge(draft, &merge_sha, merger.name(), ts)
+                    }
+                    Err(e) => {
+                        let conflicts = draft.conflicts.clone();
+                        self.reject(
+                            change,
+                            format!("merge failed: {}", e),
+                            "MERGE-FAILED".into(),
+                            conflicts,
+                            ts,
+                        )
+                    }
+                }
+            }
+            DecideOutcome::Decided(rec) => Ok(rec),
+        }
+    }
+
+    /// Decide WITHOUT merging. Pure decision logic — this is what compiles
+    /// to WASM for the Worker. Returns either a pending accept (the caller
+    /// merges, then calls complete_merge) or an already-sealed decision.
+    pub fn decide(
+        &mut self,
+        change: &mut ChangeClaim,
+        view: &ChangeView,
+        in_flight: &[ChangeView],
+        merged: &HashSet<String>,
+        ts: &str,
+    ) -> Result<DecideOutcome, String> {
         if change.status.is_terminal() {
             return Err(format!(
                 "wreck-governor: change {} is terminal ({:?})",
@@ -132,7 +176,9 @@ impl Governor {
 
         // --- CHECKED: evidence gate ---
         if let Err(reason) = Self::check_evidence(change) {
-            return self.reject(change, reason, "EVIDENCE-01".to_string(), vec![], ts);
+            return Ok(DecideOutcome::Decided(
+                self.reject(change, reason, "EVIDENCE-01".to_string(), vec![], ts)?,
+            ));
         }
 
         // --- graph: conflicts vs in-flight + policy ---
@@ -195,11 +241,23 @@ impl Governor {
 
         if let Some(p) = policy_fail {
             let rule = p.detail.clone();
-            return self.reject(change, format!("policy violation: {}", p.detail), rule, conflicts, ts);
+            return Ok(DecideOutcome::Decided(self.reject(
+                change,
+                format!("policy violation: {}", p.detail),
+                rule,
+                conflicts,
+                ts,
+            )?));
         }
         if !hard.is_empty() {
             let detail = hard.iter().map(|c| c.detail.clone()).collect::<Vec<_>>().join("; ");
-            return self.reject(change, format!("conflicts: {}", detail), "CONFLICT".into(), conflicts, ts);
+            return Ok(DecideOutcome::Decided(self.reject(
+                change,
+                format!("conflicts: {}", detail),
+                "CONFLICT".into(),
+                conflicts,
+                ts,
+            )?));
         }
 
         advance_to(change, ChangeStatus::Proven)?;
@@ -219,45 +277,47 @@ impl Governor {
                 PolicyResult { pass: true, rule: "default-allow".into() },
                 &self.parent_seal(),
             )?;
-            return self.seal(rec, ts);
+            return Ok(DecideOutcome::Decided(self.seal(rec, ts)?));
         }
 
         advance_to(change, ChangeStatus::Eligible)?;
 
-        // --- ELIGIBLE: the port merges; only then is it MERGED ---
-        match merger.merge(change) {
-            Ok(merge_sha) => {
-                advance_to(change, ChangeStatus::Merged)?;
-                let rec = DecisionRecord::draft(
-                    change,
-                    Verdict::Accept,
-                    vec![],
-                    vec![],
-                    change.claims.len() as u32,
-                    change.evidence.len() as u32,
-                    0,
-                    conflicts,
-                    PolicyResult { pass: true, rule: "default-allow".into() },
-                    &self.parent_seal(),
-                )?;
-                let mut rec = self.seal(rec, ts)?;
-                // annotate the merge sha into the receipt payload for traceability
-                if let Some(payload) = rec.receipt.get_mut("payload") {
-                    if let Some(obj) = payload.as_object_mut() {
-                        obj.insert(
-                            "merge_sha".into(),
-                            serde_json::Value::String(merge_sha.as_str().into()),
-                        );
-                        obj.insert(
-                            "merge_port".into(),
-                            serde_json::Value::String(merger.name().into()),
-                        );
-                    }
-                }
-                Ok(rec)
+        // ELIGIBLE with no conflicts and no blockers: pending the merge,
+        // which the substrate executes (local git today, Artifacts next).
+        let draft = DecisionRecord::draft(
+            change,
+            Verdict::Accept,
+            vec![],
+            vec![],
+            change.claims.len() as u32,
+            change.evidence.len() as u32,
+            0,
+            conflicts,
+            PolicyResult { pass: true, rule: "default-allow".into() },
+            &self.parent_seal(),
+        )?;
+        Ok(DecideOutcome::AcceptPending { draft })
+    }
+
+    /// Seal an accepted draft after the substrate merged it.
+    pub fn complete_merge(
+        &mut self,
+        draft: DecisionRecord,
+        merge_sha: &Sha,
+        port_name: &str,
+        ts: &str,
+    ) -> Result<DecisionRecord, String> {
+        let mut rec = self.seal(draft, ts)?;
+        if let Some(payload) = rec.receipt.get_mut("payload") {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "merge_sha".into(),
+                    serde_json::Value::String(merge_sha.as_str().into()),
+                );
+                obj.insert("merge_port".into(), serde_json::Value::String(port_name.into()));
             }
-            Err(e) => self.reject(change, format!("merge failed: {}", e), "MERGE-FAILED".into(), conflicts, ts),
         }
+        Ok(rec)
     }
 
     fn reject(

@@ -779,11 +779,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wreck-canon"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wreck-graph",
+]
+
+[[package]]
 name = "wreck-demo"
 version = "0.1.0"
 dependencies = [
  "serde_json",
  "wreck-adapters",
+ "wreck-canon",
  "wreck-governor",
  "wreck-graph",
  "wreck-protocol",
@@ -816,6 +826,17 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "wreck-wasm"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wreck-governor",
+ "wreck-graph",
+ "wreck-protocol",
 ]
 
 [[package]]
