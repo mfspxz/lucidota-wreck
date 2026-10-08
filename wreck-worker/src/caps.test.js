@@ -8,6 +8,7 @@ import {
   checkCap,
   measureJsonBytes,
   readTextCapped,
+  truncateBytes,
   utf8Len,
 } from "./caps.js";
 
@@ -141,4 +142,48 @@ test("L4: scalars and empty structures measured", () => {
   assert.equal(measureJsonBytes("", EVENT_CAP, "p"), 2);
   assert.equal(measureJsonBytes([], EVENT_CAP, "p"), 2);
   assert.equal(measureJsonBytes({}, EVENT_CAP, "p"), 2);
+});
+
+// ---------- L-A (cycle-11): undefined array elements count as null ----------
+
+test("L-A: undefined array elements are measured as 4 bytes (JSON null)", () => {
+  // JSON.stringify([undefined, undefined]) === "[null,null]" (11 bytes).
+  // The old code measured 3 — a large undefined array could pass the cap
+  // while materializing a much larger string downstream.
+  assert.equal(utf8Len(JSON.stringify([undefined, undefined])), 11);
+  assert.equal(measureJsonBytes([undefined, undefined], EVENT_CAP, "p"), 11);
+  assert.equal(measureJsonBytes({ a: [undefined] }, EVENT_CAP, "p"), utf8Len(JSON.stringify({ a: [undefined] })));
+});
+
+test("L-A: large undefined array trips the cap", () => {
+  const arr = new Array(5000).fill(undefined); // 5000*4 + commas + brackets > 16 KiB
+  assert.throws(() => measureJsonBytes(arr, EVENT_CAP, "p"), CapExceeded);
+  // and a small one still passes
+  measureJsonBytes(new Array(10).fill(undefined), EVENT_CAP, "p");
+});
+
+test("L-A: undefined object values stay conservatively counted (dropped by stringify)", () => {
+  // {a: undefined} stringifies to "{}" — the key is counted, never under.
+  const measured = measureJsonBytes({ a: undefined }, EVENT_CAP, "p");
+  assert.ok(measured >= utf8Len(JSON.stringify({ a: undefined })));
+});
+
+// ---------- L-B (cycle-11): truncateBytes ----------
+
+test("L-B: truncateBytes keeps short strings untouched", () => {
+  assert.equal(truncateBytes("hello", 4096), "hello");
+  assert.equal(truncateBytes("x".repeat(4096), 4096), "x".repeat(4096));
+});
+
+test("L-B: truncateBytes caps at the byte budget", () => {
+  const out = truncateBytes("x".repeat(10000), 4096);
+  assert.equal(utf8Len(out), 4096);
+});
+
+test("L-B: truncateBytes never splits a UTF-8 sequence", () => {
+  // "é" is 2 bytes; cutting mid-character must decode safely, not throw
+  const s = "é".repeat(3000); // 6000 bytes
+  const out = truncateBytes(s, 4095); // odd cut lands mid-character
+  assert.ok(utf8Len(out) <= 4095, `got ${utf8Len(out)} bytes`);
+  assert.doesNotThrow(() => JSON.stringify(out));
 });

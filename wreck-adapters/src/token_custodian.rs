@@ -15,8 +15,9 @@
 //!     share ONE mint, keyed by the identity fence.
 //!  5. Complete-record handling: Artifacts tokens are self-contained
 //!     (id/plaintext/expires_at); the minted record replaces, never merges.
-//!  6. Fenced commit: capture identity before I/O, re-check after;
-//!     fenced-out mints are discarded (revoked), never stored.
+//!  6. Fenced commit: capture the PER-REPO identity before I/O, re-check
+//!     after; fenced-out mints are discarded (revoked), never stored.
+//!     A rotation on repo A never fences repo B's in-flight mint (M-A).
 //!  7. Adjudicated 401s: superseded -> retry once with a fresh token;
 //!     current -> refresh-or-expire. Provider rejections are never trusted
 //!     blindly.
@@ -84,10 +85,33 @@ struct Cached {
     expires_at_unix: u64,
 }
 
+// L-E (cycle-11): overwrite a secret string in place. Volatile writes so
+// the compiler cannot elide them as dead stores; no `zeroize` crate in the
+// dependency tree, and Cached is the only secret-bearing struct here.
+//
+// SAFETY: the caller must guarantee `s` is a valid, owned string slice.
+// Zeroing preserves the UTF-8 invariant (NUL is valid UTF-8) and never
+// changes the length, so the string stays well-formed.
+unsafe fn scrub_secret(s: &mut str) {
+    for b in s.as_bytes_mut().iter_mut() {
+        std::ptr::write_volatile(b, 0);
+    }
+}
+
+impl Drop for Cached {
+    fn drop(&mut self) {
+        // SAFETY: self.plaintext is an owned String; zeroing is in-place.
+        unsafe { scrub_secret(&mut self.plaintext) };
+    }
+}
+
 struct State {
-    /// Fence generation. Bumped on every rotation/revoke. A mint that
-    /// captured an older identity is fenced out at commit and discarded.
-    identity: u64,
+    /// Per-repo fence generations. Bumped on that repo's rotation/revoke.
+    /// A mint that captured an older identity for ITS repo is fenced out
+    /// at commit and discarded. M-A (cycle-11): this used to be ONE u64
+    /// for the whole custodian — repo A's rotation fenced out repo B's
+    /// in-flight mint, wasting it (discard + revoke + retry).
+    fences: HashMap<String, u64>,
     cached: HashMap<String, Cached>,
     in_flight: HashSet<String>,
 }
@@ -128,7 +152,7 @@ impl<M: Minter> TokenCustodian<M> {
             skew_secs,
             now,
             state: Mutex::new(State {
-                identity: 0,
+                fences: HashMap::new(),
                 cached: HashMap::new(),
                 in_flight: HashSet::new(),
             }),
@@ -163,7 +187,8 @@ impl<M: Minter> TokenCustodian<M> {
                     drop(guard);
                     continue;
                 }
-                let fence = st.identity; // capture fence BEFORE network I/O
+                // M-A (cycle-11): fence is per-repo. Capture BEFORE network I/O.
+                let fence: u64 = st.fences.get(repo).copied().unwrap_or(0);
                 st.in_flight.insert(repo.to_string());
                 fence
             };
@@ -180,10 +205,11 @@ impl<M: Minter> TokenCustodian<M> {
             let outcome: Outcome = {
                 let mut st = self.state.lock().unwrap();
                 st.in_flight.remove(repo);
-                let out = if st.identity != fence {
-                    // Fenced out mid-mint (rotate/revoke landed): discard,
-                    // never store. The minted token must be revoked, not
-                    // just dropped, or an untracked live token exists.
+                let out = if st.fences.get(repo).copied().unwrap_or(0) != fence {
+                    // Fenced out mid-mint (rotate/revoke for THIS repo
+                    // landed): discard, never store. The minted token must
+                    // be revoked, not just dropped, or an untracked live
+                    // token exists.
                     Outcome::Discarded(minted.ok())
                 } else {
                     match minted {
@@ -197,7 +223,9 @@ impl<M: Minter> TokenCustodian<M> {
                                     expires_at_unix: m.expires_at_unix,
                                 },
                             );
-                            st.identity = st.identity.wrapping_add(1); // new generation
+                            // new generation for THIS repo only (M-A)
+                            let g = st.fences.get(repo).copied().unwrap_or(0);
+                            st.fences.insert(repo.to_string(), g.wrapping_add(1));
                             Outcome::Stored(out)
                         }
                         Err(e) => Outcome::Failed(e),
@@ -210,8 +238,10 @@ impl<M: Minter> TokenCustodian<M> {
             match outcome {
                 Outcome::Stored(t) => return Ok(t),
                 Outcome::Discarded(m) => {
-                    if let Some(m) = m {
+                    if let Some(mut m) = m {
                         let _ = self.minter.revoke(&m.id);
+                        // L-E: no plaintext residue. SAFETY: owned String, in-place zeroing.
+                        unsafe { scrub_secret(&mut m.plaintext) };
                     }
                     continue; // retry as follower or new leader
                 }
@@ -245,12 +275,14 @@ impl<M: Minter> TokenCustodian<M> {
         }
     }
 
-    /// Refresh-or-expire: fence out everything in flight and drop the cache.
-    /// The next `token_for` mints fresh. (The old token is NOT revoked here;
-    /// use `revoke` when the grant is known-good but must die.)
+    /// Refresh-or-expire: fence out THIS repo's in-flight mints and drop its
+    /// cache. The next `token_for` mints fresh. (The old token is NOT
+    /// revoked here; use `revoke` when the grant is known-good but must
+    /// die.) M-A: other repos' in-flight mints are untouched.
     pub fn rotate(&self, repo: &str) {
         let mut st = self.state.lock().unwrap();
-        st.identity = st.identity.wrapping_add(1);
+        let g = st.fences.get(repo).copied().unwrap_or(0);
+        st.fences.insert(repo.to_string(), g.wrapping_add(1));
         st.cached.remove(repo);
         // An in-flight mint keeps its entry; its commit is fenced out.
     }
@@ -262,9 +294,12 @@ impl<M: Minter> TokenCustodian<M> {
     pub fn revoke(&self, repo: &str) -> Result<(), String> {
         let id = {
             let mut st = self.state.lock().unwrap();
-            st.identity = st.identity.wrapping_add(1); // fence first
+            let g = st.fences.get(repo).copied().unwrap_or(0);
+            st.fences.insert(repo.to_string(), g.wrapping_add(1)); // fence first
             match st.cached.remove(repo) {
-                Some(c) => c.id,
+                // E0509: Cached implements Drop (L-E scrubbing), so the id
+                // is cloned — the plaintext is scrubbed on drop regardless.
+                Some(c) => c.id.clone(),
                 None => return Ok(()),
             }
         };
@@ -529,8 +564,118 @@ mod tests {
     fn ct_eq_empty() {
         assert!(TokenCustodian::<FakeMinterRef>::ct_eq("", ""));
     }
-}
+    // --- M-A (cycle-11): per-repo fence ---------------------------------
 
+    #[test]
+    fn rotate_other_repo_does_not_fence_this_mint() {
+        // Repo A's mint is in flight (blocked inside the fake). A rotation
+        // on repo B must NOT fence it out: the mint is stored, not
+        // discarded+revoked+retried.
+        let now = Arc::new(AtomicU64::new(1000));
+        let (m, entered) = FakeMinter::new(1900);
+        let (rel_tx, rel_rx) = mpsc::channel::<()>();
+        *m.release_rx.lock().unwrap() = Some(rel_rx);
+        let m = Arc::new(m);
+        let c = Arc::new(TokenCustodian::with_clock(
+            FakeMinterRef(m.clone()),
+            DEFAULT_TTL_SECS,
+            DEFAULT_SKEW_SECS,
+            clock_at(now),
+        ));
+        let c2 = c.clone();
+        let h = thread::spawn(move || c2.token_for("a").unwrap());
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("leader entered mint for a");
+        c.rotate("b"); // rotation on a DIFFERENT repo
+        let _ = rel_tx.send(());
+        let tok = h.join().unwrap();
+        assert_eq!(tok, "secret-1", "mint for a must be stored, not fenced out");
+        assert_eq!(m.mint_count(), 1, "no retry mint");
+        assert_eq!(m.revoke_count(), 0, "nothing revoked");
+        assert_eq!(c.token_for("a").unwrap(), "secret-1");
+    }
+
+    #[test]
+    fn same_repo_rotate_still_fences_its_own_mint() {
+        // Per-repo fencing must not weaken the same-repo guarantee:
+        // rotate("a") mid-mint for "a" still discards + revokes.
+        let now = Arc::new(AtomicU64::new(1000));
+        let (m, entered) = FakeMinter::new(1900);
+        let (rel_tx, rel_rx) = mpsc::channel::<()>();
+        *m.release_rx.lock().unwrap() = Some(rel_rx);
+        let m = Arc::new(m);
+        let c = Arc::new(TokenCustodian::with_clock(
+            FakeMinterRef(m.clone()),
+            DEFAULT_TTL_SECS,
+            DEFAULT_SKEW_SECS,
+            clock_at(now),
+        ));
+        let c2 = c.clone();
+        let h = thread::spawn(move || c2.token_for("a").unwrap());
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("leader entered mint");
+        c.rotate("a");
+        let _ = rel_tx.send(());
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("leader retried into second mint");
+        let _ = rel_tx.send(());
+        assert_eq!(h.join().unwrap(), "secret-2");
+        assert_eq!(m.mint_count(), 2);
+        assert_eq!(m.revoke_count(), 1);
+        assert_eq!(m.revoked_ids(), vec!["tok-1".to_string()]);
+    }
+
+    // --- L-E (cycle-11): plaintext scrubbing --------------------------------
+    //
+    // Memory scrubbing itself is not unit-observable (no safe way to read
+    // freed memory); these tests pin the API-visible half — after rotate /
+    // revoke / replacement the old plaintext is unreachable through the
+    // custodian — and the Drop impl is verified by code read.
+
+    #[test]
+    fn old_plaintext_unrecoverable_after_rotate() {
+        let now = Arc::new(AtomicU64::new(1000));
+        let (m, _entered) = FakeMinter::new(1900);
+        let m = Arc::new(m);
+        let c = TokenCustodian::with_clock(
+            FakeMinterRef(m.clone()),
+            DEFAULT_TTL_SECS,
+            DEFAULT_SKEW_SECS,
+            clock_at(now),
+        );
+        let t1 = c.token_for("r").unwrap();
+        c.rotate("r");
+        // cache is empty: adjudicate falls to the fail-closed default
+        // (Current = "refresh past it"), and the next token_for mints
+        // fresh — the old plaintext is never served again.
+        assert_eq!(c.adjudicate("r", &t1), Adjudication::Current);
+        let t2 = c.token_for("r").unwrap();
+        assert_ne!(t1, t2);
+        assert_eq!(m.mint_count(), 2);
+    }
+
+    #[test]
+    fn old_plaintext_unrecoverable_after_revoke() {
+        let now = Arc::new(AtomicU64::new(1000));
+        let (m, _entered) = FakeMinter::new(1900);
+        let m = Arc::new(m);
+        let c = TokenCustodian::with_clock(
+            FakeMinterRef(m.clone()),
+            DEFAULT_TTL_SECS,
+            DEFAULT_SKEW_SECS,
+            clock_at(now),
+        );
+        let t1 = c.token_for("r").unwrap();
+        c.revoke("r").unwrap();
+        assert_eq!(c.adjudicate("r", &t1), Adjudication::Current);
+        assert_eq!(m.revoke_count(), 1);
+        let t2 = c.token_for("r").unwrap();
+        assert_ne!(t1, t2);
+    }
+}
 #[cfg(test)]
 mod h4_redaction_tests {
     use super::*;

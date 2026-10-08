@@ -43,6 +43,11 @@ export function parseEvent(event) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,62}$/.test(src.repoName)) {
     fail(`source.repoName is not a valid change_id: ${JSON.stringify(src.repoName)}`);
   }
+  // L-C (cycle-11): namespace flows into dedupKey and (future) state-source
+  // queries — same charset rule as change_id, before it becomes a path/DB key.
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,62}$/.test(src.namespace)) {
+    fail(`source.namespace is not a valid namespace: ${JSON.stringify(src.namespace)}`);
+  }
   for (const f of ["ref", "before", "after"]) {
     if (typeof pay[f] !== "string" || pay[f].length === 0) {
       fail(`payload.${f} missing or empty`);

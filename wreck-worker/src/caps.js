@@ -51,7 +51,8 @@ export function utf8Len(str) {
  * moment the running total exceeds cap: the accumulator never holds more
  * than cap + one JSON atom. Slightly conservative around undefined-valued
  * object keys (counted, then dropped by JSON.stringify) — fail-closed
- * direction, never under-counts.
+ * direction. L-A (cycle-11): undefined ARRAY elements are NOT dropped —
+ * JSON.stringify emits `null` (4B) for them, so they count 4 here.
  */
 export function measureJsonBytes(value, cap, what) {
   const enc = new TextEncoder();
@@ -60,8 +61,11 @@ export function measureJsonBytes(value, cap, what) {
     total += n;
     if (total > cap) throw new CapExceeded(what, total, cap);
   };
-  (function walk(v) {
-    if (v === null || v === undefined) return add(v === null ? 4 : 0);
+  (function walk(v, inArray = false) {
+    if (v === null) return add(4);
+    // L-A: in arrays JSON.stringify(undefined) -> "null" (4B); in objects
+    // the key is dropped entirely (counted conservatively at the key site).
+    if (v === undefined) return add(inArray ? 4 : 0);
     switch (typeof v) {
       case "boolean":
         return add(v ? 4 : 5);
@@ -74,7 +78,7 @@ export function measureJsonBytes(value, cap, what) {
           add(2); // [ ]
           for (let i = 0; i < v.length; i++) {
             if (i > 0) add(1);
-            walk(v[i]);
+            walk(v[i], true);
           }
           return;
         }
@@ -84,7 +88,7 @@ export function measureJsonBytes(value, cap, what) {
           if (!first) add(1);
           first = false;
           add(enc.encode(JSON.stringify(k)).length + 1); // "k":
-          walk(v[k]);
+          walk(v[k], false);
         }
         return;
       default:
@@ -92,6 +96,20 @@ export function measureJsonBytes(value, cap, what) {
     }
   })(value);
   return total;
+}
+
+/**
+ * L-B (cycle-11): truncate a string to a byte budget without splitting a
+ * UTF-8 sequence. Backs off over continuation bytes to the last complete
+ * character — the output is always <= maxBytes and decodes cleanly (no
+ * U+FFFD, no throw). Used for agent-controlled free text embedded in claims.
+ */
+export function truncateBytes(str, maxBytes) {
+  const bytes = new TextEncoder().encode(str);
+  if (bytes.length <= maxBytes) return str;
+  let cut = maxBytes;
+  while (cut > 0 && (bytes[cut] & 0xc0) === 0x80) cut--; // skip continuation bytes
+  return new TextDecoder().decode(bytes.slice(0, cut));
 }
 
 /**

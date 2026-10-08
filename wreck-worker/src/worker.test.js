@@ -12,6 +12,9 @@ import {
   handlePush,
   inFlightViews,
   mergedIds,
+  readBlobCapped,
+  treeBlobs,
+  waitVisible,
 } from "./worker.js";
 import worker from "./worker.js";
 import { IdempotencyGate } from "./idempotency.js";
@@ -427,4 +430,174 @@ test("L4: at-cap object body passes the measurer", async () => {
   const msg = mockMsg(small);
   await handleMessage(msg, mockEnv([]), null);
   assert.deepEqual(msg.calls, ["retry"], "at-cap object must pass measurement");
+});
+
+// ---------- L-C (cycle-11): namespace charset validation ----------
+
+test("L-C: bad namespace is InvalidEvent (poison)", () => {
+  const ev = {
+    type: "x",
+    source: { type: "artifacts.repo", namespace: "../../evil", repoName: "task-9" },
+    payload: { ref: "r", before: "a", after: "b" },
+  };
+  assert.throws(() => parseEvent(ev), InvalidEvent);
+  const ev2 = {
+    type: "x",
+    source: { type: "artifacts.repo", namespace: "", repoName: "task-9" },
+    payload: { ref: "r", before: "a", after: "b" },
+  };
+  assert.throws(() => parseEvent(ev2), InvalidEvent);
+});
+
+test("L-C: valid namespaces still parse", () => {
+  for (const ns of ["wreck", "ns-1", "ns_2", "a.b", "N3"]) {
+    const ev = parseEvent({
+      source: { namespace: ns, repoName: "task-9" },
+      payload: { ref: "r", before: "a", after: "b" },
+    });
+    assert.equal(ev.namespace, ns);
+  }
+});
+
+// ---------- M-B (cycle-11): tree/blob caps on the Worker path ----------
+
+test("M-B: treeBlobs refuses trees deeper than 64", async () => {
+  // each level nests one tree; depth 100 must trip the cap
+  const repo = {
+    async readTree(hash) {
+      const depth = parseInt(hash, 10);
+      if (depth >= 100) return [];
+      return [{ type: "tree", path: "d", hash: String(depth + 1) }];
+    },
+  };
+  await assert.rejects(treeBlobs(repo, "0"), /tree depth exceeds 64/);
+});
+
+test("M-B: treeBlobs refuses more than 100k entries", async () => {
+  const repo = {
+    async readTree() {
+      return Array.from({ length: 100_001 }, (_, i) => ({ type: "blob", path: `f${i}`, hash: "h" }));
+    },
+  };
+  await assert.rejects(treeBlobs(repo, "root"), /tree entries exceed/);
+});
+
+test("M-B: treeBlobs walks a normal tree fine", async () => {
+  const repo = {
+    async readTree(hash) {
+      if (hash === "root") return [{ type: "tree", path: "src", hash: "t1" }, { type: "blob", path: "a", hash: "h1" }];
+      if (hash === "t1") return [{ type: "blob", path: "b", hash: "h2" }];
+      return [];
+    },
+  };
+  const out = await treeBlobs(repo, "root");
+  assert.deepEqual([...out.keys()].sort(), ["a", "src/b"]);
+});
+
+test("M-B: readBlobCapped rejects a >32 MiB blob mid-stream", async () => {
+  // real Response: the streaming path via readTextCapped
+  const big = new Response("x".repeat(33 * 1024 * 1024));
+  const repo = { async readBlob() { return big; } };
+  await assert.rejects(readBlobCapped(repo, "h"), /cap_exceeded/);
+});
+
+test("M-B: readBlobCapped passes a small blob through", async () => {
+  const repo = { async readBlob() { return new Response("hello"); } };
+  assert.equal(await readBlobCapped(repo, "h"), "hello");
+});
+
+// ---------- M-C (cycle-11): bounded waitVisible, then poison ----------
+
+test("M-C: waitVisible sleeps on the bounded backoff schedule, then poisons", async () => {
+  const sleeps = [];
+  const env = {
+    ARTIFACTS: { get: () => ({ async readCommit() { return null; } }) },
+  };
+  const ev = { repoName: "task-9", after: "b".repeat(40) };
+  await assert.rejects(
+    waitVisible(env, ev, 3, async (ms) => { sleeps.push(ms); }),
+    InvalidEvent,
+  );
+  // bounded: exactly `tries` sleeps on the 500*(i+1) schedule — no more
+  assert.deepEqual(sleeps, [500, 1000, 1500]);
+});
+
+test("M-C: waitVisible returns the commit as soon as it is visible", async () => {
+  let sleeps = 0;
+  const commit = { message: "hi" };
+  let calls = 0;
+  const env = {
+    ARTIFACTS: { get: () => ({ async readCommit() { return ++calls >= 2 ? commit : null; } }) },
+  };
+  const out = await waitVisible(env, { repoName: "r", after: "b" }, 5, async () => { sleeps++; });
+  assert.equal(out, commit);
+  assert.equal(sleeps, 1, "only one sleep before the commit appeared");
+});
+
+test("M-C: never-visible commit is poison (acked), not retried forever", async () => {
+  // The unit guarantees compose: (1) waitVisible throws InvalidEvent on
+  // exhaustion (tested above, fast, no real sleeps); (2) handleMessage
+  // acks any InvalidEvent escaping handlePush — proven here with a
+  // malformed event that throws InvalidEvent at the boundary.
+  const order = [];
+  const env = mockEnv(order);
+  const msg = mockMsg({ namespace: "wreck", repo: "flat-shape-is-poison" });
+  await handleMessage(msg, env, null);
+  assert.deepEqual(msg.calls, ["ack"], "InvalidEvent must be acked, never retried");
+});
+
+// ---------- L-B (cycle-11): intent capped at 4 KiB ----------
+
+test("L-B: commit first-line intent is capped at 4096 bytes", () => {
+  const ev = parseEvent(officialEvent("task-9"));
+  const claim = claimFromCommit(ev, { message: `${"I".repeat(10000)}\nbody`, author: {} });
+  assert.equal(new TextEncoder().encode(claim.intent).length, 4096);
+});
+
+test("L-B: trailer intent is capped at 4096 bytes too", () => {
+  const ev = parseEvent(officialEvent("task-9"));
+  const after = {
+    message: `do it\n\nWreck-Claim: ${JSON.stringify({ intent: "T".repeat(10000) })}`,
+    author: {},
+  };
+  const claim = claimFromCommit(ev, after);
+  assert.equal(new TextEncoder().encode(claim.intent).length, 4096);
+});
+
+test("L-B: short intents pass through untouched", () => {
+  const ev = parseEvent(officialEvent("task-9"));
+  const claim = claimFromCommit(ev, { message: "fix the thing", author: {} });
+  assert.equal(claim.intent, "fix the thing");
+});
+
+// ---------- L-D (cycle-11): KV read outside the mutex ----------
+
+test("L-D: concurrent claims for different keys read KV concurrently", async () => {
+  const gate = new IdempotencyGate();
+  const startedGets = [];
+  const resolvers = [];
+  const kv = {
+    async get(k) {
+      startedGets.push(k);
+      await new Promise((res) => resolvers.push(res)); // gated: we release manually
+      return null;
+    },
+  };
+  const p1 = gate.claim("ka", kv);
+  const p2 = gate.claim("kb", kv);
+  // let both claims run to their KV read
+  await new Promise((r) => setTimeout(r, 50));
+  // with the old code the second claim's get() could not start until the
+  // first claim's mutex section (including its KV read) finished
+  assert.deepEqual(startedGets.sort(), ["ka", "kb"], "both KV reads must be in flight");
+  resolvers.forEach((r) => r());
+  assert.equal(await p1, "claimed");
+  assert.equal(await p2, "claimed");
+});
+
+test("L-D: same-key claims still serialize — no double claim", async () => {
+  const gate = new IdempotencyGate();
+  const kv = { async get() { return null; } };
+  const [a, b] = await Promise.all([gate.claim("k", kv), gate.claim("k", kv)]);
+  assert.deepEqual([a, b].sort(), ["claimed", "inflight"]);
 });

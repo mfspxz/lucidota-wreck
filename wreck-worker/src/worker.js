@@ -28,6 +28,8 @@ import {
   WASM_INPUT_CAP,
   checkCap,
   measureJsonBytes,
+  readTextCapped,
+  truncateBytes,
   utf8Len,
 } from "./caps.js";
 import { InvalidEvent, dedupKey, parseEvent } from "./event.js";
@@ -273,15 +275,25 @@ async function handlePush(event, env, w, deps = {}) {
   }
 }
 
-/** Poll the binding until `after` is readable (usually immediate). */
-async function waitVisible(env, ev, tries) {
+/** Poll the binding until `after` is readable (usually immediate).
+ *
+ * M-C (cycle-11): bounded, then poison. The old shape threw a generic
+ * Error here, so a permanently invisible commit burned ~7.5s per
+ * redelivery FOREVER (each retry re-ran the full sleep loop). Now the
+ * attempts are bounded to one 7.5s window and a never-visible commit is
+ * InvalidEvent — acked, never retried. Tradeoff, documented: a commit
+ * that becomes visible later than ~7.5s after its push event is dropped;
+ * the retry-read window covers normal propagation, and the alternative
+ * is unbounded isolate burn.
+ */
+async function waitVisible(env, ev, tries, sleepMs = (ms) => new Promise((r) => setTimeout(r, ms))) {
   const repo = env.ARTIFACTS.get(ev.repoName); // throws until status === "ready"
   for (let i = 0; i < tries; i++) {
     const c = await repo.readCommit(ev.after); // metadata | null
     if (c) return c;
-    await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+    await sleepMs(500 * (i + 1));
   }
-  throw new Error(`commit ${ev.after} never became visible`);
+  throw new InvalidEvent(`commit ${ev.after} never became visible after ${tries} attempts`);
 }
 
 async function buildView(env, ev, after) {
@@ -295,22 +307,62 @@ async function buildView(env, ev, after) {
     const oh = oldBlobs.get(path);
     const nh = newBlobs.get(path);
     if (oh === nh) continue;
-    const oldText = oh ? await (await repo.readBlob(oh)).text() : "";
-    const newText = nh ? await (await repo.readBlob(nh)).text() : "";
+    // M-B: blob reads are byte-capped (32 MiB) — the old code read every
+    // changed blob fully into isolate memory.
+    const oldText = oh ? await readBlobCapped(repo, oh) : "";
+    const newText = nh ? await readBlobCapped(repo, nh) : "";
     files.push({ path, ...diffRanges(oldText, newText) });
   }
   return { change_id: ev.repoName, files, symbols: [], invariants: [], contracts: [], dependencies: [] };
 }
 
-/** Recursive tree walk via readTree (immediate children only). */
-async function treeBlobs(repo, hash, prefix = "", out = new Map()) {
+/** Recursive tree walk via readTree (immediate children only).
+ *
+ * M-B (cycle-11): capped like the Rust walk_tree (M2: depth 64, 100k
+ * entries). The Worker path had no cap — a hostile tree could OOM the
+ * isolate. Fail-closed: over-limit trees throw, never partially walk.
+ */
+const TREE_MAX_DEPTH = 64;
+const TREE_MAX_ENTRIES = 100_000;
+/** Per-blob byte cap — same 32 MiB as the Rust read_capped (L3). */
+const BLOB_MAX_BYTES = 32 * 1024 * 1024;
+
+async function treeBlobs(repo, hash, prefix = "", out = new Map(), depth = 0) {
+  if (depth > TREE_MAX_DEPTH) {
+    throw new Error(`wreck: tree depth exceeds ${TREE_MAX_DEPTH}`);
+  }
+  if (out.size > TREE_MAX_ENTRIES) {
+    throw new Error(`wreck: tree entries exceed ${TREE_MAX_ENTRIES}`);
+  }
   const entries = (await repo.readTree(hash)) || [];
   for (const e of entries) {
     const path = prefix ? `${prefix}/${e.path}` : e.path;
-    if (e.type === "tree") await treeBlobs(repo, e.hash, path, out);
-    else out.set(path, e.hash);
+    if (e.type === "tree") await treeBlobs(repo, e.hash, path, out, depth + 1);
+    else {
+      out.set(path, e.hash);
+      if (out.size > TREE_MAX_ENTRIES) {
+        throw new Error(`wreck: tree entries exceed ${TREE_MAX_ENTRIES}`);
+      }
+    }
   }
   return out;
+}
+
+/**
+ * Read one blob with a byte cap (M-B). Prefers streaming through
+ * readTextCapped when the binding returns a stream-capable Response;
+ * falls back to a measured .text() for non-Response shapes (test
+ * doubles). The fallback materializes the blob — acceptable only
+ * outside production, where readBlob returns a real Response.
+ */
+async function readBlobCapped(repo, hash) {
+  const resp = await repo.readBlob(hash);
+  if (resp && resp.body && typeof resp.body.getReader === "function") {
+    return readTextCapped(resp.body, BLOB_MAX_BYTES, `blob ${hash}`);
+  }
+  const text = await resp.text();
+  checkCap(utf8Len(text), BLOB_MAX_BYTES, `blob ${hash}`);
+  return text;
 }
 
 /** Minimal -U0 hunk parser (mirrors the Rust parse_unified_zero). */
@@ -335,6 +387,13 @@ function diffRanges(oldText, newText) {
  * declared semantics — the documented fallback).
  */
 const TRAILER_ALLOWLIST = ["intent", "scope", "claims", "evidence", "dependencies"];
+/**
+ * L-B (cycle-11): the commit-message first line is agent-controlled free
+ * text embedded in the claim → decide input. Cap it at 4 KiB (truncate,
+ * never reject — the measured diff is the real decision input; the
+ * intent is a summary). The WASM 1 MiB cap is the backstop, not the policy.
+ */
+const INTENT_CAP = 4096;
 
 function claimFromCommit(ev, after) {
   // The claim rides the push: parse the `Wreck-Claim:` trailer from the
@@ -353,7 +412,7 @@ function claimFromCommit(ev, after) {
     task_id: ev.repoName,
     base: ev.before,
     head: ev.after,
-    intent: msg.split("\n")[0] || "",
+    intent: truncateBytes(msg.split("\n")[0] || "", INTENT_CAP),
     scope: [],
     claims: [],
     evidence: [],
@@ -371,7 +430,7 @@ function claimFromCommit(ev, after) {
   const picked = {};
   if ("intent" in claimed) {
     if (typeof claimed.intent !== "string") return base; // type violation: drop trailer
-    picked.intent = claimed.intent;
+    picked.intent = truncateBytes(claimed.intent, INTENT_CAP); // L-B: same cap as the subject line
   }
   for (const f of ["scope", "claims", "evidence", "dependencies"]) {
     if (f in claimed) {
@@ -434,4 +493,4 @@ async function notifyAgent(env, claim, decision) {
 
 // Named exports for unit tests (node --test). The default export above is
 // the Worker entrypoint.
-export { handlePush, handleMessage, claimFromCommit, inFlightViews, mergedIds, activePolicy, initAuthorityKey, callWasm };
+export { handlePush, handleMessage, claimFromCommit, treeBlobs, readBlobCapped, waitVisible, inFlightViews, mergedIds, activePolicy, initAuthorityKey, callWasm };

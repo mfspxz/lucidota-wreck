@@ -417,7 +417,15 @@ impl Governor {
         // Rejection is only reachable from CHECKED; if we already passed it
         // (e.g. merge failed at ELIGIBLE), record the verdict without a
         // status transition — the decision record is the source of truth.
-        let _ = change.transition(ChangeStatus::Rejected);
+        //
+        // L-F (cycle-11): surface the transition error, never swallow it.
+        // A failed transition means the claim is already terminal — the
+        // verdict still seals, but the anomaly is sealed INTO the record
+        // instead of disappearing (status/verdict skew otherwise).
+        let mut reason = reason;
+        if let Err(e) = change.transition(ChangeStatus::Rejected) {
+            reason = format!("{} [transition skipped: {}]", reason, e);
+        }
         let rec = DecisionRecord::draft(
             change,
             Verdict::Reject { reason, rule },
@@ -868,6 +876,66 @@ mod tests {
             Some(s1)
         );
         assert_eq!(g.decisions_sealed(), 2);
+    }
+    // --- L-F (cycle-11): reject() surfaces transition errors -------------
+
+    #[test]
+    fn reject_on_terminal_claim_seals_the_skew_into_the_record() {
+        let (mut g, _key) = gov();
+        let (mut c, _v) = mk_change("wreck-lf", vec![]);
+        // drive the claim to terminal Rejected: the transition inside
+        // reject() now FAILS (already terminal) instead of succeeding.
+        c.transition(ChangeStatus::Observed).unwrap();
+        c.transition(ChangeStatus::Rejected).unwrap();
+        let d = g
+            .reject(
+                &mut c,
+                "merge failed: boom".into(),
+                "MERGE-FAILED".into(),
+                vec![],
+                "ts",
+            )
+            .unwrap();
+        // the verdict still seals (the decision record is the source of
+        // truth) ...
+        match &d.verdict {
+            Verdict::Reject { reason, rule } => {
+                assert_eq!(rule, "MERGE-FAILED");
+                // ... but the anomaly is visible in the sealed reason,
+                // never silently swallowed.
+                assert!(
+                    reason.contains("transition skipped"),
+                    "skew must be surfaced, reason: {}",
+                    reason
+                );
+                assert!(reason.contains("merge failed: boom"), "reason: {}", reason);
+            }
+            v => panic!("expected Reject, got {:?}", v),
+        }
+        // and the claim status is untouched (still terminal Rejected)
+        assert_eq!(c.status, ChangeStatus::Rejected);
+    }
+
+    #[test]
+    fn reject_on_nonterminal_claim_has_no_skew_marker() {
+        let (mut g, _key) = gov();
+        let (mut c, _v) = mk_change("wreck-lf2", vec![]);
+        c.transition(ChangeStatus::Observed).unwrap();
+        c.transition(ChangeStatus::Checked).unwrap();
+        let d = g
+            .reject(&mut c, "nope".into(), "EVIDENCE-01".into(), vec![], "ts")
+            .unwrap();
+        match &d.verdict {
+            Verdict::Reject { reason, .. } => {
+                assert!(
+                    !reason.contains("transition skipped"),
+                    "no skew on the happy path, reason: {}",
+                    reason
+                );
+            }
+            v => panic!("expected Reject, got {:?}", v),
+        }
+        assert_eq!(c.status, ChangeStatus::Rejected);
     }
 }
 
