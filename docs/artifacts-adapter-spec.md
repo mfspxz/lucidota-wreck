@@ -103,6 +103,23 @@ Poll `list()` and check `status === "ready"` before minting tokens or reading.
 For line-level ranges the adapter needs blob bytes — `readBlob`/`readFile` return `Blob`;
 use `await blob.text()` then diff locally. This is the review loop's core; budget subrequests.
 
+### Cheap check before expensive work (standing rule)
+
+Adopted from the OS's `artifact-sync.ts:237-245` (cycle-14/15): before any
+expensive transfer, run the cheapest read that can prove there is nothing to do.
+
+- OS example: `listServerRefs` on `refs/heads/<branch>`; if the tip equals the
+  stored commit → `{ changed: false }`, no clone. The expensive fetch only runs
+  when the cheap check proves work exists.
+- Wreck analog: `waitVisible` polls for read-visibility of `after` before the
+  tree walk — the walk is the expensive part and never runs on an invisible commit.
+
+Rule: every adapter read path that can turn into a multi-request walk must start
+with a single cheap existence/freshness check. The check itself is one bounded
+request. A failed cheap check retries the expensive path — it never silently
+reports "no change" (a false "changed" costs requests; a false "unchanged" drops
+governance).
+
 **No write path exists** in binding or REST. All mutations are git pushes (§5).
 
 ---
@@ -139,6 +156,11 @@ use `await blob.text()` then diff locally. This is the review loop's core; budge
 
 **Adapter pattern:** per task → `createToken("write", 900)` → hand `{ remote, plaintext }` to the agent
 → agent pushes → on verdict, `revokeToken(id)` + `delete(repo)`.
+
+**Inventory rule (cycle-15, OS `listGitTokens`):** if a token list is ever exposed
+(UI, API, logs), filter through "user-held" = `scope == "write" && state == "active"`.
+Internal / custodian tokens (read scope, expired, revoked, unknown shape) are never
+listed — a token inventory is an attack surface, not a feature.
 
 ---
 

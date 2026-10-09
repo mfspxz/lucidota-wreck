@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use wreck_graph::{ChangeView, FileChange};
+use wreck_graph::{ChangeView, FileChange, SkippedFile};
 use wreck_protocol::{ChangeClaim, ScopeItem, Sha};
 
 // ---------------------------------------------------------------------------
@@ -131,6 +131,43 @@ impl std::fmt::Debug for MintTokenResult {
             .field("expires_at", &self.expires_at)
             .finish()
     }
+}
+
+/// One entry of the repo token inventory (`GET repos/:name/tokens`).
+/// Carries NO plaintext: listings must never carry secret material (H4).
+/// `scope`/`state` are optional because the live shape is unverified
+/// pending Workers Paid; missing fields fail closed toward hiding.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitToken {
+    pub id: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+/// User-held token class: what a user-facing inventory may show.
+/// Mirrors the OS's listGitTokens filter (context-collection.ts:732-739):
+/// only active write tokens are user-held. Internal / custodian tokens
+/// (read scope, expired, revoked, or unknown shape) are never exposed.
+pub fn is_user_held(t: &GitToken) -> bool {
+    t.scope.as_deref() == Some("write") && t.state.as_deref() == Some("active")
+}
+
+/// On a freshly created repo, every token present must be platform
+/// auto-created (nobody could have minted one yet). Pure: returns the ids
+/// to revoke. Unit-tested without network.
+fn tokens_to_revoke_on_create(tokens: &[GitToken]) -> Vec<String> {
+    tokens.iter().map(|t| t.id.clone()).collect()
+}
+
+/// Result of [`ArtifactsClient::create_repo_clean`].
+pub struct CleanRepo {
+    pub result: CreateRepoResult,
+    /// Ids of auto-created tokens that were revoked.
+    pub revoked: Vec<String>,
+    /// Non-fatal problems (revoke failures, inventory failures).
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -337,6 +374,67 @@ impl ArtifactsClient {
         self.delete(&url)
     }
 
+    /// Token inventory for one repo.
+    /// Endpoint is doc-grounded (spec §5: `GET $BASE/repos/:name/tokens`).
+    pub fn list_repo_tokens(&self, repo: &str) -> Result<Vec<GitToken>, String> {
+        let url = format!(
+            "{}/repos/{}/tokens",
+            ns_base(&self.account_id, &self.namespace),
+            repo
+        );
+        self.get(&url)
+    }
+
+    /// User-facing token inventory: only the user-held class.
+    /// Mirrors the OS's listGitTokens filter (context-collection.ts:732-739).
+    /// Checklist rule: a token list is NEVER exposed unfiltered — internal /
+    /// custodian tokens stay invisible.
+    pub fn list_user_tokens(&self, repo: &str) -> Result<Vec<GitToken>, String> {
+        Ok(self
+            .list_repo_tokens(repo)?
+            .into_iter()
+            .filter(is_user_held)
+            .collect())
+    }
+
+    /// Create a repo and immediately revoke the platform's auto-created
+    /// initial token(s), matching the OS's context-collection.ts:196-205
+    /// ("We don't want or need this token").
+    ///
+    /// On a freshly created repo every token present must be auto-created —
+    /// nobody could have minted one yet. Revoke failures are warnings, never
+    /// errors: the repo was created; failing here would mislead the caller
+    /// into thinking it doesn't exist (OS warn-on-failure, artifact-sync.ts).
+    ///
+    /// UNVERIFIED live: whether the `create` endpoint actually auto-creates a
+    /// token (the OS code asserts it does; wreck's live path awaits
+    /// Workers Paid). Until verified, expect a possible inventory warning.
+    pub fn create_repo_clean(&self, name: &str) -> Result<CleanRepo, String> {
+        let result = self.create_repo(name)?;
+        let mut revoked = vec![];
+        let mut warnings = vec![];
+        match self.list_repo_tokens(name) {
+            Ok(tokens) => {
+                for id in tokens_to_revoke_on_create(&tokens) {
+                    match self.revoke_token(&id) {
+                        Ok(()) => revoked.push(id),
+                        Err(e) => {
+                            warnings.push(format!("create_repo_clean: revoke {id} failed: {e}"))
+                        }
+                    }
+                }
+            }
+            Err(e) => warnings.push(format!(
+                "create_repo_clean: token inventory failed, auto-created tokens may stand: {e}"
+            )),
+        }
+        Ok(CleanRepo {
+            result,
+            revoked,
+            warnings,
+        })
+    }
+
     pub fn delete_repo(&self, name: &str) -> Result<(), String> {
         // 202 Accepted: async delete; the name may linger briefly.
         let url = format!(
@@ -393,6 +491,72 @@ fn read_capped<R: std::io::Read>(r: R, cap: u64, what: &str) -> Result<Vec<u8>, 
         ));
     }
     Ok(buf)
+}
+
+/// True when `e` is a byte-cap rejection (reject-never-truncate), as opposed
+/// to a transport failure. Tied to `read_capped`'s message above; a new
+/// capped reader must keep the "byte cap" marker.
+fn is_cap_rejection(e: &str) -> bool {
+    e.contains("byte cap")
+}
+
+/// Per-file resolution of a diff pair.
+enum FileOutcome {
+    Measured { change: FileChange, bytes: u64 },
+    Skipped { path: String, reason: String },
+}
+
+/// Pure per-file resolution for `diff_view`, unit-tested without network.
+/// Cycle-15 (OS artifact-sync.ts pattern): a byte-cap rejection on either
+/// side skips the file with a warn — oversized CONTENT is skipped, never
+/// silently truncated and never fatal to the whole diff. Transport failures
+/// still fail the diff; envelopes (claims/events) still reject elsewhere.
+fn resolve_file(
+    path: &str,
+    old: Result<Vec<u8>, String>,
+    new: Result<Vec<u8>, String>,
+) -> Result<FileOutcome, String> {
+    let old_bytes = match old {
+        Ok(b) => b,
+        Err(e) if is_cap_rejection(&e) => {
+            return Ok(FileOutcome::Skipped {
+                path: path.to_string(),
+                reason: format!("old blob: {e}"),
+            })
+        }
+        Err(e) => return Err(e),
+    };
+    let new_bytes = match new {
+        Ok(b) => b,
+        Err(e) if is_cap_rejection(&e) => {
+            return Ok(FileOutcome::Skipped {
+                path: path.to_string(),
+                reason: format!("new blob: {e}"),
+            })
+        }
+        Err(e) => return Err(e),
+    };
+    let bytes = (old_bytes.len() + new_bytes.len()) as u64;
+    // likely-binary blobs: measured with empty ranges (pre-existing behavior)
+    if old_bytes.contains(&0) || new_bytes.contains(&0) {
+        return Ok(FileOutcome::Measured {
+            change: FileChange {
+                path: path.to_string(),
+                added: vec![],
+                removed: vec![],
+            },
+            bytes,
+        });
+    }
+    let (added, removed) = diff_ranges(&old_bytes, &new_bytes)?;
+    Ok(FileOutcome::Measured {
+        change: FileChange {
+            path: path.to_string(),
+            added,
+            removed,
+        },
+        bytes,
+    })
 }
 
 /// Running byte budget for one diff_view: fail-closed when exhausted.
@@ -582,6 +746,9 @@ impl ArtifactsClient {
         paths.dedup();
         // L3: a hostile fork could touch thousands of 32MB blobs; the total
         // diff budget fails closed before memory pressure becomes a DoS.
+        // Per-blob cap rejections skip-with-warn (cycle-15, OS artifact-sync
+        // pattern: oversized CONTENT is skipped, oversized ENVELOPES reject);
+        // the total budget below still fails closed (transfer-level).
         let mut budget = ByteBudget::new(MAX_TOTAL_DIFF_BYTES);
         let mut measured: HashMap<String, FileChange> = HashMap::new();
         for path in paths {
@@ -590,37 +757,23 @@ impl ArtifactsClient {
             if oh == nh {
                 continue;
             }
-            let old_bytes = match oh {
-                Some(h) => self.blob_bytes(repo, h)?,
-                None => vec![],
+            let old = match oh {
+                Some(h) => self.blob_bytes(repo, h),
+                None => Ok(vec![]),
             };
-            let new_bytes = match nh {
-                Some(h) => self.blob_bytes(repo, h)?,
-                None => vec![],
+            let new = match nh {
+                Some(h) => self.blob_bytes(repo, h),
+                None => Ok(vec![]),
             };
-            budget.take((old_bytes.len() + new_bytes.len()) as u64, &path)?;
-            // skip likely-binary blobs (each blob is now hard-capped at
-            // MAX_BLOB_BYTES, and the total diff budget above is enforced)
-            if old_bytes.contains(&0) || new_bytes.contains(&0) {
-                measured.insert(
-                    path.clone(),
-                    FileChange {
-                        path: path.clone(),
-                        added: vec![],
-                        removed: vec![],
-                    },
-                );
-                continue;
+            match resolve_file(&path, old, new)? {
+                FileOutcome::Skipped { path, reason } => {
+                    view.skipped.push(SkippedFile { path, reason });
+                }
+                FileOutcome::Measured { change, bytes } => {
+                    budget.take(bytes, &change.path)?;
+                    measured.insert(change.path.clone(), change);
+                }
             }
-            let (added, removed) = diff_ranges(&old_bytes, &new_bytes)?;
-            measured.insert(
-                path.clone(),
-                FileChange {
-                    path,
-                    added,
-                    removed,
-                },
-            );
         }
         for f in view.files.iter_mut() {
             if let Some(m) = measured.remove(&f.path) {
@@ -1008,5 +1161,87 @@ mod tests {
     fn merge_pins_conflictstyle() {
         let pin = ArtifactsMergePort::merge_pin_args();
         assert_eq!(pin, ["-c", "merge.conflictstyle=merge"]);
+    }
+
+    // ---- cycle-15: token inventory hygiene + skip-with-warn ----
+
+    fn tok(id: &str, scope: Option<&str>, state: Option<&str>) -> GitToken {
+        GitToken {
+            id: id.to_string(),
+            scope: scope.map(|s| s.to_string()),
+            state: state.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn fresh_repo_revokes_every_token_present() {
+        // On a fresh repo every token present is auto-created: revoke all.
+        let tokens = vec![
+            tok("a", Some("write"), Some("active")),
+            tok("b", None, None),
+        ];
+        assert_eq!(
+            tokens_to_revoke_on_create(&tokens),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(tokens_to_revoke_on_create(&[]).is_empty());
+    }
+
+    #[test]
+    fn user_inventory_hides_internal_tokens() {
+        let tokens = vec![
+            tok("u1", Some("write"), Some("active")), // user-held: shown
+            tok("i1", Some("read"), Some("active")),  // custodian read token: hidden
+            tok("u2", Some("write"), Some("expired")), // dead grant: hidden
+            tok("u3", Some("write"), Some("revoked")), // dead grant: hidden
+            tok("i2", None, None),                    // unknown shape: hidden (fail-closed)
+        ];
+        let shown: Vec<String> = tokens
+            .iter()
+            .filter(|t| is_user_held(t))
+            .map(|t| t.id.clone())
+            .collect();
+        assert_eq!(shown, vec!["u1".to_string()]);
+    }
+
+    fn cap_err() -> String {
+        // A genuine read_capped rejection, not a hand-written string.
+        read_capped(std::io::Cursor::new(vec![0u8; 11]), 10, "test").unwrap_err()
+    }
+
+    #[test]
+    fn resolve_file_skips_on_cap_rejection() {
+        // Old side over cap: skip-with-warn, never fatal to the diff.
+        let r = resolve_file("big.bin", Err(cap_err()), Ok(vec![1, 2, 3])).unwrap();
+        match r {
+            FileOutcome::Skipped { path, reason } => {
+                assert_eq!(path, "big.bin");
+                assert!(reason.contains("old blob"));
+            }
+            _ => panic!("expected Skipped"),
+        }
+        // New side over cap: same.
+        let r = resolve_file("big.bin", Ok(vec![]), Err(cap_err())).unwrap();
+        assert!(matches!(r, FileOutcome::Skipped { .. }));
+    }
+
+    #[test]
+    fn resolve_file_fails_on_transport_error() {
+        // Transport failures still fail the diff — only cap rejections skip.
+        let r = resolve_file("x", Err("artifacts GET https://x: 500".into()), Ok(vec![]));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn resolve_file_measures_normal_pairs() {
+        let r = resolve_file("a.txt", Ok(b"a\n".to_vec()), Ok(b"b\n".to_vec())).unwrap();
+        match r {
+            FileOutcome::Measured { change, bytes } => {
+                assert_eq!(change.path, "a.txt");
+                assert_eq!(bytes, 4);
+                assert!(!change.added.is_empty() || !change.removed.is_empty());
+            }
+            _ => panic!("expected Measured"),
+        }
     }
 }

@@ -53,6 +53,20 @@ pub struct ChangeView {
     pub invariants: Vec<String>,
     pub contracts: Vec<String>,
     pub dependencies: Vec<String>,
+    /// Files deliberately not measured, with the reason.
+    /// Cycle-15 (OS artifact-sync pattern): oversized *content* is skipped
+    /// with a warn; oversized *envelopes* are rejected. The skip travels
+    /// with the view so the governor can record it in provenance instead
+    /// of silently dropping evidence.
+    #[serde(default)]
+    pub skipped: Vec<SkippedFile>,
+}
+
+/// One file the adapter skipped measuring.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkippedFile {
+    pub path: String,
+    pub reason: String,
 }
 
 impl ChangeView {

@@ -307,6 +307,57 @@ impl<M: Minter> TokenCustodian<M> {
     }
 }
 
+/// Result of [`TokenCustodian::with_one_shot`].
+#[derive(Debug)]
+pub struct OneShot<T> {
+    pub value: T,
+    /// Non-fatal problems (revoke-after-use failures). Never errors:
+    /// the operation's own outcome decides success.
+    pub warnings: Vec<String>,
+}
+
+impl<M: Minter> TokenCustodian<M> {
+    /// One-shot token use for low-frequency paths — the OS artifact-sync.ts
+    /// pattern (cycle-14/15): mint fresh per call, run `op`, revoke in a
+    /// finally-equivalent, warn-on-failure (never throw on revoke).
+    ///
+    /// Bypasses the shared cache entirely: no skew math, no singleflight,
+    /// no cache pollution. Use for provisioning and one-off reads; the
+    /// hot path keeps `token_for`.
+    ///
+    /// Revoke failures are warnings, never errors — expiry (`ttl_secs`) is
+    /// the backstop, exactly as in the OS design. Plaintext is scrubbed
+    /// after use (L-E).
+    pub fn with_one_shot<T>(
+        &self,
+        repo: &str,
+        ttl_secs: u64,
+        op: impl FnOnce(&str) -> Result<T, String>,
+    ) -> Result<OneShot<T>, String> {
+        let mut minted = self.minter.mint(repo, ttl_secs)?;
+        let outcome = op(&minted.plaintext);
+        // finally-equivalent: revoke regardless of the op outcome.
+        let mut warnings = vec![];
+        if let Err(e) = self.minter.revoke(&minted.id) {
+            warnings.push(format!("one-shot: revoke {} failed: {e}", minted.id));
+        }
+        // L-E: no plaintext residue. SAFETY: owned String, in-place zeroing.
+        unsafe { scrub_secret(&mut minted.plaintext) };
+        match outcome {
+            Ok(value) => Ok(OneShot { value, warnings }),
+            Err(e) => {
+                let mut msg = e;
+                for w in warnings {
+                    msg.push_str(" [");
+                    msg.push_str(&w);
+                    msg.push(']');
+                }
+                Err(msg)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +375,7 @@ mod tests {
         entered_tx: mpsc::Sender<()>,
         release_rx: Mutex<Option<mpsc::Receiver<()>>>,
         delay: Duration,
+        fail_revoke: Mutex<bool>,
     }
 
     impl FakeMinter {
@@ -337,9 +389,13 @@ mod tests {
                     entered_tx: tx,
                     release_rx: Mutex::new(None),
                     delay: Duration::from_millis(0),
+                    fail_revoke: Mutex::new(false),
                 },
                 rx,
             )
+        }
+        fn make_revoke_fail(&self) {
+            *self.fail_revoke.lock().unwrap() = true;
         }
         fn mint_count(&self) -> usize {
             self.calls
@@ -390,6 +446,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("revoke {}", token_id));
+            if *self.fail_revoke.lock().unwrap() {
+                return Err("fake: revoke failed".to_string());
+            }
             Ok(())
         }
     }
@@ -674,6 +733,65 @@ mod tests {
         assert_eq!(m.revoke_count(), 1);
         let t2 = c.token_for("r").unwrap();
         assert_ne!(t1, t2);
+    }
+
+    // ---- cycle-15: one-shot mint/use/revoke (OS artifact-sync pattern) ----
+
+    fn one_shot_custodian(m: Arc<FakeMinter>) -> TokenCustodian<FakeMinterRef> {
+        let now = Arc::new(AtomicU64::new(1000));
+        TokenCustodian::with_clock(FakeMinterRef(m), 900, 60, clock_at(now))
+    }
+
+    #[test]
+    fn one_shot_mints_uses_revokes_and_bypasses_cache() {
+        let (m, _entered) = FakeMinter::new(9999);
+        let m = Arc::new(m);
+        let c = one_shot_custodian(m.clone());
+        let r = c
+            .with_one_shot("r", 300, |tok| {
+                assert!(tok.starts_with("secret-"));
+                Ok::<_, String>(tok.len())
+            })
+            .unwrap();
+        assert!(r.warnings.is_empty());
+        assert_eq!(m.mint_count(), 1);
+        // the one-shot token was revoked after use (revoke-after-use)
+        assert_eq!(m.revoked_ids(), vec!["tok-1".to_string()]);
+        // and it never touched the shared cache: token_for mints fresh
+        let _ = c.token_for("r").unwrap();
+        assert_eq!(m.mint_count(), 2);
+    }
+
+    #[test]
+    fn one_shot_revokes_even_when_op_fails() {
+        let (m, _entered) = FakeMinter::new(9999);
+        let m = Arc::new(m);
+        let c = one_shot_custodian(m.clone());
+        let r = c.with_one_shot("r", 300, |_| Err::<(), String>("op blew up".into()));
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("op blew up"));
+        // finally-equivalent: the token was still revoked
+        assert_eq!(m.revoked_ids(), vec!["tok-1".to_string()]);
+    }
+
+    #[test]
+    fn one_shot_revoke_failure_is_a_warning_not_an_error() {
+        let (m, _entered) = FakeMinter::new(9999);
+        let m = Arc::new(m);
+        m.make_revoke_fail();
+        let c = one_shot_custodian(m.clone());
+        let r = c
+            .with_one_shot("r", 300, |_| Ok::<_, String>("done"))
+            .unwrap();
+        assert_eq!(r.value, "done");
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("revoke tok-1 failed"));
+        // and on op failure the revoke warning rides along on the error
+        let e = c
+            .with_one_shot("r", 300, |_| Err::<(), String>("op blew up".into()))
+            .unwrap_err();
+        assert!(e.contains("op blew up"));
+        assert!(e.contains("revoke tok-2 failed"));
     }
 }
 #[cfg(test)]
