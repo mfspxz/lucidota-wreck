@@ -253,6 +253,41 @@ pub struct MergeRecord {
     pub port: String,
 }
 
+/// What a decision was derived from. Mirrors the Cloudflare OS
+/// observation-log pattern (cycle-01): taint follows the data — the record
+/// states what was read, and the hash binds the exact bytes consumed.
+/// `Blob` is reserved for the Worker/adapter boundary (raw blob fetches);
+/// the governor itself never reads blobs, so it emits Claim/Diff/Policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceKind {
+    Blob,
+    Diff,
+    Claim,
+    Policy,
+}
+
+/// One derived-from entry: a single resource the governor actually consumed
+/// while producing a decision. Populated by the governor at read time —
+/// never from agent declarations (the claim carries no provenance field,
+/// and nothing the agent writes is parsed for entries).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvenanceEntry {
+    pub kind: ProvenanceKind,
+    pub id: String,
+    /// sha256 of the canonical bytes consumed (hex), or the pinned digest
+    /// the governor required (evidence items).
+    pub hash: String,
+}
+
+/// Deterministic content hash of any serializable value: hex sha256 of the
+/// canonical JSON. Binds a provenance entry to the exact bytes read.
+pub fn content_hash<T: Serialize>(v: &T) -> Result<String, String> {
+    let val =
+        serde_json::to_value(v).map_err(|e| format!("wreck-protocol: serialize failed: {}", e))?;
+    pl::canon::hash_record(&val)
+}
+
 /// A conflict discovered by the change graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictRef {
@@ -299,6 +334,13 @@ pub struct DecisionRecord {
     /// with the decision — never added to the receipt post-seal.
     #[serde(default)]
     pub merge: Option<MergeRecord>,
+    /// Derived-from provenance: every input the governor actually consumed
+    /// while producing this decision (claim, evidence, measured diffs,
+    /// evaluated policy rules). Recorded at read time, never from agent
+    /// declarations; part of the hashed canonical value. Empty on legacy
+    /// records (serde default).
+    #[serde(default)]
+    pub provenance: Vec<ProvenanceEntry>,
     /// `lucidota-receipt/1` envelope sealing this decision.
     pub receipt: Map<String, Value>,
 }
@@ -332,6 +374,7 @@ impl DecisionRecord {
             decision_hash: String::new(),
             parent_decision: parent_decision.to_string(),
             merge: None,
+            provenance: Vec::new(),
             receipt: Map::new(),
         };
         rec.decision_hash = rec.compute_hash()?;
@@ -346,6 +389,24 @@ impl DecisionRecord {
             merge_sha,
             port: port.to_string(),
         });
+        self.decision_hash = self.compute_hash()?;
+        Ok(self)
+    }
+
+    /// Attach derived-from provenance BEFORE sealing. Re-hashes, because
+    /// provenance is part of the decision: it must be covered by
+    /// decision_hash, exactly like the merge outcome. Dedupes on
+    /// (kind, id); the first entry wins.
+    pub fn with_provenance(mut self, entries: Vec<ProvenanceEntry>) -> Result<Self, String> {
+        for e in entries {
+            if !self
+                .provenance
+                .iter()
+                .any(|p| p.kind == e.kind && p.id == e.id)
+            {
+                self.provenance.push(e);
+            }
+        }
         self.decision_hash = self.compute_hash()?;
         Ok(self)
     }
@@ -397,6 +458,10 @@ impl DecisionRecord {
         m.insert(
             "merge".into(),
             serde_json::to_value(&self.merge).unwrap_or(Value::Null),
+        );
+        m.insert(
+            "provenance".into(),
+            serde_json::to_value(&self.provenance).unwrap_or(Value::Null),
         );
         Value::Object(m)
     }

@@ -10,8 +10,8 @@
 use std::collections::HashSet;
 use wreck_graph::{classify, ChangeView, Policy};
 use wreck_protocol::{
-    ChangeClaim, ChangeStatus, ConflictKind, ConflictRef, DecisionRecord, PolicyResult, Sha,
-    Verdict,
+    ChangeClaim, ChangeStatus, ConflictKind, ConflictRef, DecisionRecord, PolicyResult,
+    ProvenanceEntry, ProvenanceKind, Sha, Verdict,
 };
 
 /// The substrate's merge operation. The governor decides; the port executes.
@@ -182,6 +182,16 @@ impl Governor {
         Ok(())
     }
 
+    /// Build one provenance entry for an input the governor consumed.
+    /// Callers pass the content hash of the exact bytes read.
+    fn prov_entry(kind: ProvenanceKind, id: &str, hash: String) -> ProvenanceEntry {
+        ProvenanceEntry {
+            kind,
+            id: id.to_string(),
+            hash,
+        }
+    }
+
     /// Run one change through the full pipeline. Mutates the claim's status.
     /// Resumable: a Blocked claim sitting at PROVEN re-enters cleanly.
     /// Returns the sealed decision record.
@@ -202,12 +212,17 @@ impl Governor {
                 }
                 Err(e) => {
                     let conflicts = draft.conflicts.clone();
+                    // The draft already carries decide-time provenance;
+                    // the merge-failed rejection inherits it rather than
+                    // rebuilding (same inputs were consumed).
+                    let prov = draft.provenance.clone();
                     self.reject(
                         change,
                         format!("merge failed: {}", e),
                         "MERGE-FAILED".into(),
                         conflicts,
                         ts,
+                        prov,
                     )
                 }
             },
@@ -232,6 +247,30 @@ impl Governor {
                 change.change_id, change.status
             ));
         }
+
+        // --- provenance: derived-from tracking (cycle-12, mirrors the
+        // Cloudflare OS observation log — taint follows the data). Entries
+        // are recorded AT READ TIME, only for inputs the governor actually
+        // consumed: never from agent declarations (the claim carries no
+        // provenance field, and nothing agent-written is parsed for
+        // entries). An early reject's provenance therefore contains the
+        // claim and evidence but no diffs or policy rules it never reached.
+        // The claim entry binds the as-given bytes (status before advance).
+        let mut prov: Vec<ProvenanceEntry> = vec![Self::prov_entry(
+            ProvenanceKind::Claim,
+            &change.change_id,
+            wreck_protocol::content_hash(change)?,
+        )];
+        for e in &change.evidence {
+            // evidence entry hash = the pinned digest the governor required
+            // and consumed (non-empty enforced by check_evidence).
+            prov.push(ProvenanceEntry {
+                kind: ProvenanceKind::Claim,
+                id: e.id.clone(),
+                hash: e.digest.clone(),
+            });
+        }
+
         advance_to(change, ChangeStatus::Checked)?;
 
         // --- CHECKED: evidence gate ---
@@ -242,8 +281,17 @@ impl Governor {
                 "EVIDENCE-01".to_string(),
                 vec![],
                 ts,
+                prov,
             )?));
         }
+
+        // The scope-attestation check reads the measured view's files, so
+        // the view entry is recorded BEFORE it runs.
+        prov.push(Self::prov_entry(
+            ProvenanceKind::Diff,
+            &view.change_id,
+            wreck_protocol::content_hash(view)?,
+        ));
 
         // --- CHECKED: scope attestation (measured vs declared) ---
         if let Err(reason) = Self::check_scope_attestation(change, view) {
@@ -253,6 +301,7 @@ impl Governor {
                 "SCOPE-01".to_string(),
                 vec![],
                 ts,
+                prov,
             )?));
         }
 
@@ -272,6 +321,13 @@ impl Governor {
             if other.change_id == change.change_id {
                 continue;
             }
+            // Record the view at classification time — a skipped (self)
+            // view is never recorded.
+            prov.push(Self::prov_entry(
+                ProvenanceKind::Diff,
+                &other.change_id,
+                wreck_protocol::content_hash(other)?,
+            ));
             conflicts.extend(classify(view, other, merged, &self.policy));
         }
         // dedup on (kind, with_change, detail)
@@ -289,6 +345,13 @@ impl Governor {
         });
         // policy self-check (classify only reports it per pair)
         for rule in &self.policy.rules {
+            // The rule is evaluated here, so its provenance is recorded
+            // here — every rule the loop touches was read.
+            prov.push(Self::prov_entry(
+                ProvenanceKind::Policy,
+                &rule.id,
+                wreck_protocol::content_hash(rule)?,
+            ));
             if view.contracts.iter().any(|c| *c == rule.forbidden_contract)
                 && !conflicts.iter().any(|c| c.kind == ConflictKind::Policy)
             {
@@ -326,6 +389,7 @@ impl Governor {
                 rule,
                 conflicts,
                 ts,
+                prov,
             )?));
         }
         if !hard.is_empty() {
@@ -340,6 +404,7 @@ impl Governor {
                 "CONFLICT".into(),
                 conflicts,
                 ts,
+                prov,
             )?));
         }
 
@@ -363,6 +428,7 @@ impl Governor {
                 },
                 &self.parent_seal(),
             )?;
+            let rec = rec.with_provenance(prov)?;
             return Ok(DecideOutcome::Decided(self.seal(rec, ts)?));
         }
 
@@ -385,6 +451,7 @@ impl Governor {
             },
             &self.parent_seal(),
         )?;
+        let draft = draft.with_provenance(prov)?;
         Ok(DecideOutcome::AcceptPending { draft })
     }
 
@@ -413,6 +480,7 @@ impl Governor {
         rule: String,
         conflicts: Vec<ConflictRef>,
         ts: &str,
+        prov: Vec<ProvenanceEntry>,
     ) -> Result<DecisionRecord, String> {
         // Rejection is only reachable from CHECKED; if we already passed it
         // (e.g. merge failed at ELIGIBLE), record the verdict without a
@@ -441,6 +509,9 @@ impl Governor {
             },
             &self.parent_seal(),
         )?;
+        // Provenance is sealed with the rejection, exactly as with
+        // accepts: the record states what the verdict was derived from.
+        let rec = rec.with_provenance(prov)?;
         self.seal(rec, ts)
     }
 
@@ -894,6 +965,7 @@ mod tests {
                 "MERGE-FAILED".into(),
                 vec![],
                 "ts",
+                vec![],
             )
             .unwrap();
         // the verdict still seals (the decision record is the source of
@@ -923,7 +995,14 @@ mod tests {
         c.transition(ChangeStatus::Observed).unwrap();
         c.transition(ChangeStatus::Checked).unwrap();
         let d = g
-            .reject(&mut c, "nope".into(), "EVIDENCE-01".into(), vec![], "ts")
+            .reject(
+                &mut c,
+                "nope".into(),
+                "EVIDENCE-01".into(),
+                vec![],
+                "ts",
+                vec![],
+            )
             .unwrap();
         match &d.verdict {
             Verdict::Reject { reason, .. } => {
@@ -936,6 +1015,137 @@ mod tests {
             v => panic!("expected Reject, got {:?}", v),
         }
         assert_eq!(c.status, ChangeStatus::Rejected);
+    }
+
+    // Cycle-12: provenance records ONLY what the governor actually read.
+    // The sealed decision's provenance must contain the claim, its
+    // evidence, the measured view, each classified in-flight view, and
+    // each evaluated policy rule — and must NOT contain a skipped view,
+    // an unseen change, anything smuggled through agent-written text, or
+    // merged-set lookups (membership answers, not content reads).
+    #[test]
+    fn provenance_only_contains_consumed_inputs() {
+        let (mut g, key) = gov();
+        let (mut c, mut v) = file_view("w-prov", "src/p.rs", vec![(1, 10)]);
+        v.dependencies = vec!["w-dep".into()];
+        // The agent tries to smuggle a fake provenance entry through
+        // evidence text. The governor never parses agent strings for
+        // provenance — nothing may appear for w-ghost.
+        c.evidence.push(Evidence {
+            id: "C1-E2".into(),
+            kind: EvidenceKind::Test,
+            reference: "C1: provenance w-ghost blob deadbeef".into(),
+            digest: "sha256:def".into(),
+        });
+        let (_, other) = file_view("w-other", "src/q.rs", vec![(1, 5)]);
+        // Same change_id as the claim: skipped by the classify loop, so
+        // its bytes must never be recorded.
+        let (_, selfskip) = file_view("w-prov", "src/other.rs", vec![(9, 9)]);
+        let d = g
+            .evaluate(
+                &mut c,
+                &v,
+                &[other, selfskip],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T23:00:00Z",
+            )
+            .unwrap();
+        assert!(matches!(d.verdict, Verdict::Blocked { .. }));
+        // sealed WITH provenance: the envelope covers it
+        d.verify_receipt_with(&key).unwrap();
+
+        let has = |kind: &ProvenanceKind, id: &str| {
+            d.provenance.iter().any(|p| &p.kind == kind && p.id == id)
+        };
+        // every consumed input is recorded
+        assert!(has(&ProvenanceKind::Claim, "w-prov"));
+        assert!(has(&ProvenanceKind::Claim, "C1-E1"));
+        assert!(has(&ProvenanceKind::Claim, "C1-E2"));
+        assert!(has(&ProvenanceKind::Diff, "w-prov"));
+        assert!(has(&ProvenanceKind::Diff, "w-other"));
+        assert!(has(&ProvenanceKind::Policy, "CANON-31"));
+        assert_eq!(d.provenance.len(), 6);
+        // never read: the smuggled ghost, unseen changes, merged-set
+        // lookups, raw blobs (the governor never reads blobs)
+        assert!(!has(&ProvenanceKind::Claim, "w-ghost"));
+        assert!(!has(&ProvenanceKind::Diff, "w-ghost"));
+        assert!(!has(&ProvenanceKind::Diff, "w-dep"));
+        assert!(!has(&ProvenanceKind::Claim, "w-dep"));
+        assert!(!d.provenance.iter().any(|p| p.kind == ProvenanceKind::Blob));
+        // evidence entries carry the pinned digest the governor required
+        let e1 = d.provenance.iter().find(|p| p.id == "C1-E1").unwrap();
+        assert_eq!(e1.hash, "sha256:abc");
+        // the diff entry binds the OWN view's bytes — not the skipped one's
+        let own = d
+            .provenance
+            .iter()
+            .find(|p| p.kind == ProvenanceKind::Diff && p.id == "w-prov")
+            .unwrap();
+        assert_eq!(own.hash, wreck_protocol::content_hash(&v).unwrap());
+        assert_eq!(own.hash.len(), 64);
+        // the policy entry binds the evaluated rule's bytes
+        let rule = d
+            .provenance
+            .iter()
+            .find(|p| p.kind == ProvenanceKind::Policy)
+            .unwrap();
+        assert_eq!(
+            rule.hash,
+            wreck_protocol::content_hash(&wreck_graph::PolicyRule {
+                id: "CANON-31".into(),
+                forbidden_contract: "auth.error-semantics".into(),
+                reason: "C-17".into(),
+            })
+            .unwrap()
+        );
+        // the claim entry binds the as-given claim bytes (64-hex digest)
+        let claim = d
+            .provenance
+            .iter()
+            .find(|p| p.kind == ProvenanceKind::Claim && p.id == "w-prov")
+            .unwrap();
+        assert_eq!(claim.hash.len(), 64);
+        assert!(claim.hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    // Cycle-12: an early EVIDENCE-01 reject never reached the view, the
+    // in-flight set, or the policy rules — its provenance must say so.
+    #[test]
+    fn early_reject_provenance_contains_only_what_was_read() {
+        let (mut g, key) = gov();
+        let mut c = ChangeClaim::propose(
+            "w-noev",
+            "a",
+            "t",
+            Sha::new(&"a".repeat(40)).unwrap(),
+            Sha::new(&"b".repeat(40)).unwrap(),
+            "x",
+        )
+        .expect("valid change_id");
+        c.claims.push(Claim {
+            id: "C1".into(),
+            statement: "s".into(),
+            kind: ClaimKind::PreservesApi,
+        });
+        // no evidence at all → EVIDENCE-01 before any view/policy read
+        let v = ChangeView::from_scope("w-noev", &c.scope);
+        let d = g
+            .evaluate(
+                &mut c,
+                &v,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T23:00:00Z",
+            )
+            .unwrap();
+        assert!(matches!(d.verdict, Verdict::Reject { .. }));
+        d.verify_receipt_with(&key).unwrap();
+        // only the claim itself was read
+        assert_eq!(d.provenance.len(), 1);
+        assert!(matches!(d.provenance[0].kind, ProvenanceKind::Claim));
+        assert_eq!(d.provenance[0].id, "w-noev");
     }
 }
 
