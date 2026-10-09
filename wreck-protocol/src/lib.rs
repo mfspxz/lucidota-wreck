@@ -256,8 +256,10 @@ pub struct MergeRecord {
 /// What a decision was derived from. Mirrors the Cloudflare OS
 /// observation-log pattern (cycle-01): taint follows the data — the record
 /// states what was read, and the hash binds the exact bytes consumed.
-/// `Blob` is reserved for the Worker/adapter boundary (raw blob fetches);
-/// the governor itself never reads blobs, so it emits Claim/Diff/Policy.
+/// `Blob` entries are emitted by the Worker/adapter boundary at fetch time
+/// (raw blob reads) and *consumed* by the governor — never synthesized:
+/// the governor itself never reads blobs, so a Blob entry in a decision
+/// always came from the reader that fetched the bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceKind {
@@ -286,6 +288,28 @@ pub fn content_hash<T: Serialize>(v: &T) -> Result<String, String> {
     let val =
         serde_json::to_value(v).map_err(|e| format!("wreck-protocol: serialize failed: {}", e))?;
     pl::canon::hash_record(&val)
+}
+
+/// Hex sha256 of raw bytes. The canonical hash for blob provenance:
+/// the entry binds the exact bytes the reader consumed.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
+}
+
+/// Build one Blob provenance entry for bytes a reader actually fetched.
+/// `id` is the blob's key in the reader's domain (path or object hash);
+/// `hash` is sha256 of the exact bytes read — never a claimed digest.
+/// Cycle-19: emitted at fetch time by the Worker/adapter boundary,
+/// consumed (never synthesized) by the governor.
+pub fn blob_provenance_entry(id: &str, bytes: &[u8]) -> ProvenanceEntry {
+    ProvenanceEntry {
+        kind: ProvenanceKind::Blob,
+        id: id.to_string(),
+        hash: sha256_hex(bytes),
+    }
 }
 
 /// A conflict discovered by the change graph.
@@ -396,13 +420,17 @@ impl DecisionRecord {
     /// Attach derived-from provenance BEFORE sealing. Re-hashes, because
     /// provenance is part of the decision: it must be covered by
     /// decision_hash, exactly like the merge outcome. Dedupes on
-    /// (kind, id); the first entry wins.
+    /// (kind, id, hash); the first entry wins. The hash is part of the
+    /// key because two observations of the same resource with different
+    /// bytes (e.g. a blob's old and new sides) are different
+    /// observations — deduping on (kind, id) alone would silently drop
+    /// one side of every diff (cycle-19).
     pub fn with_provenance(mut self, entries: Vec<ProvenanceEntry>) -> Result<Self, String> {
         for e in entries {
             if !self
                 .provenance
                 .iter()
-                .any(|p| p.kind == e.kind && p.id == e.id)
+                .any(|p| p.kind == e.kind && p.id == e.id && p.hash == e.hash)
             {
                 self.provenance.push(e);
             }

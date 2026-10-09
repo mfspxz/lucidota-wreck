@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { InvalidEvent, dedupKey, parseEvent } from "./event.js";
 import {
   activePolicy,
+  buildView,
   callWasm,
   claimFromCommit,
   handleMessage,
@@ -600,4 +601,63 @@ test("L-D: same-key claims still serialize — no double claim", async () => {
   const kv = { async get() { return null; } };
   const [a, b] = await Promise.all([gate.claim("k", kv), gate.claim("k", kv)]);
   assert.deepEqual([a, b].sort(), ["claimed", "inflight"]);
+});
+
+// ---------- cycle-19: blob provenance emission in buildView ----------
+
+test("cycle-19: buildView emits blob provenance binding the bytes read", async () => {
+  const blobs = { h1: "old text\n", h2: "new text\n" };
+  const repo = {
+    async readTree(hash) {
+      if (hash === "before") return [{ type: "blob", path: "f.txt", hash: "h1" }];
+      if (hash === "after") return [{ type: "blob", path: "f.txt", hash: "h2" }];
+      return [];
+    },
+    async readBlob(hash) { return new Response(blobs[hash]); },
+  };
+  const env = { ARTIFACTS: { get: () => repo } };
+  const view = await buildView(env, { repoName: "r", before: "before", after: "after" });
+  const { createHash } = await import("node:crypto");
+  const hex = (s) => createHash("sha256").update(s, "utf8").digest("hex");
+  // old and new sides each get an entry; the hash binds the exact
+  // bytes the diff consumed — never a claimed digest.
+  assert.deepEqual(view.blob_provenance, [
+    { kind: "blob", id: "f.txt", hash: hex("old text\n") },
+    { kind: "blob", id: "f.txt", hash: hex("new text\n") },
+  ]);
+});
+
+test("cycle-19: buildView emits nothing for absent sides", async () => {
+  // added file: absent from the old tree → no old-side entry, never faked
+  const repo = {
+    async readTree(hash) {
+      if (hash === "before") return [];
+      if (hash === "after") return [{ type: "blob", path: "new.txt", hash: "h9" }];
+      return [];
+    },
+    async readBlob() { return new Response("brand new\n"); },
+  };
+  const env = { ARTIFACTS: { get: () => repo } };
+  const view = await buildView(env, { repoName: "r", before: "before", after: "after" });
+  assert.equal(view.blob_provenance.length, 1);
+  assert.equal(view.blob_provenance[0].id, "new.txt");
+});
+
+test("cycle-19: buildView provenance reflects tampered bytes", async () => {
+  // the store returns bytes that are NOT what the blob hash claimed —
+  // the entry binds the ACTUAL bytes read, exposing the mismatch
+  const repo = {
+    async readTree(hash) {
+      if (hash === "before") return [{ type: "blob", path: "t.txt", hash: "h-tampered" }];
+      return [];
+    },
+    async readBlob() { return new Response("MALICIOUS\n"); },
+  };
+  const env = { ARTIFACTS: { get: () => repo } };
+  const view = await buildView(env, { repoName: "r", before: "before", after: "after" });
+  const { createHash } = await import("node:crypto");
+  const hex = (s) => createHash("sha256").update(s, "utf8").digest("hex");
+  assert.equal(view.blob_provenance.length, 1);
+  assert.equal(view.blob_provenance[0].hash, hex("MALICIOUS\n"));
+  assert.notEqual(view.blob_provenance[0].hash, hex("legitimate\n"));
 });

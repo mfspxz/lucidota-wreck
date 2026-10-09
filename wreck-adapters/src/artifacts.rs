@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use wreck_graph::{ChangeView, FileChange, SkippedFile};
-use wreck_protocol::{ChangeClaim, ScopeItem, Sha};
+use wreck_protocol::{ChangeClaim, ProvenanceEntry, ScopeItem, Sha};
 
 // ---------------------------------------------------------------------------
 // pure URL + payload construction (unit-tested, no network)
@@ -506,57 +506,84 @@ enum FileOutcome {
     Skipped { path: String, reason: String },
 }
 
-/// Pure per-file resolution for `diff_view`, unit-tested without network.
-/// Cycle-15 (OS artifact-sync.ts pattern): a byte-cap rejection on either
-/// side skips the file with a warn — oversized CONTENT is skipped, never
-/// silently truncated and never fatal to the whole diff. Transport failures
-/// still fail the diff; envelopes (claims/events) still reject elsewhere.
+/// Per-file resolution of a diff pair, plus the blob provenance emitted for
+/// the bytes actually read (cycle-19, observation-log pattern).
+///
+/// `old`/`new` are `None` when the side was absent (added/deleted file —
+/// nothing fetched, nothing emitted, never faked). `Some(Ok(bytes))` emits
+/// one Blob entry binding the exact bytes read; `Some(Err(_))` emits
+/// nothing: cap rejections skip-with-warn, transport failures are fatal.
+///
+/// Pure over its inputs: unit-testable without network, including the
+/// tamper case — a mocked fetch returning wrong bytes yields an entry
+/// whose hash matches the *actual* bytes, never the claimed digest.
 fn resolve_file(
     path: &str,
-    old: Result<Vec<u8>, String>,
-    new: Result<Vec<u8>, String>,
-) -> Result<FileOutcome, String> {
+    old: Option<Result<Vec<u8>, String>>,
+    new: Option<Result<Vec<u8>, String>>,
+) -> Result<(FileOutcome, Vec<ProvenanceEntry>), String> {
+    let mut prov = Vec::new();
     let old_bytes = match old {
-        Ok(b) => b,
-        Err(e) if is_cap_rejection(&e) => {
-            return Ok(FileOutcome::Skipped {
-                path: path.to_string(),
-                reason: format!("old blob: {e}"),
-            })
+        None => vec![],
+        Some(Ok(b)) => {
+            prov.push(wreck_protocol::blob_provenance_entry(path, &b));
+            b
         }
-        Err(e) => return Err(e),
+        Some(Err(e)) if is_cap_rejection(&e) => {
+            return Ok((
+                FileOutcome::Skipped {
+                    path: path.to_string(),
+                    reason: format!("old blob: {e}"),
+                },
+                prov,
+            ))
+        }
+        Some(Err(e)) => return Err(e),
     };
     let new_bytes = match new {
-        Ok(b) => b,
-        Err(e) if is_cap_rejection(&e) => {
-            return Ok(FileOutcome::Skipped {
-                path: path.to_string(),
-                reason: format!("new blob: {e}"),
-            })
+        None => vec![],
+        Some(Ok(b)) => {
+            prov.push(wreck_protocol::blob_provenance_entry(path, &b));
+            b
         }
-        Err(e) => return Err(e),
+        Some(Err(e)) if is_cap_rejection(&e) => {
+            return Ok((
+                FileOutcome::Skipped {
+                    path: path.to_string(),
+                    reason: format!("new blob: {e}"),
+                },
+                prov,
+            ))
+        }
+        Some(Err(e)) => return Err(e),
     };
     let bytes = (old_bytes.len() + new_bytes.len()) as u64;
     // likely-binary blobs: measured with empty ranges (pre-existing behavior)
     if old_bytes.contains(&0) || new_bytes.contains(&0) {
-        return Ok(FileOutcome::Measured {
-            change: FileChange {
-                path: path.to_string(),
-                added: vec![],
-                removed: vec![],
+        return Ok((
+            FileOutcome::Measured {
+                change: FileChange {
+                    path: path.to_string(),
+                    added: vec![],
+                    removed: vec![],
+                },
+                bytes,
             },
-            bytes,
-        });
+            prov,
+        ));
     }
     let (added, removed) = diff_ranges(&old_bytes, &new_bytes)?;
-    Ok(FileOutcome::Measured {
-        change: FileChange {
-            path: path.to_string(),
-            added,
-            removed,
+    Ok((
+        FileOutcome::Measured {
+            change: FileChange {
+                path: path.to_string(),
+                added,
+                removed,
+            },
+            bytes,
         },
-        bytes,
-    })
+        prov,
+    ))
 }
 
 /// Running byte budget for one diff_view: fail-closed when exhausted.
@@ -757,15 +784,15 @@ impl ArtifactsClient {
             if oh == nh {
                 continue;
             }
-            let old = match oh {
-                Some(h) => self.blob_bytes(repo, h),
-                None => Ok(vec![]),
-            };
-            let new = match nh {
-                Some(h) => self.blob_bytes(repo, h),
-                None => Ok(vec![]),
-            };
-            match resolve_file(&path, old, new)? {
+            let old = oh.map(|h| self.blob_bytes(repo, h));
+            let new = nh.map(|h| self.blob_bytes(repo, h));
+            // Cycle-19: blob provenance rides the view — one entry per blob
+            // whose bytes were actually read (absent/cap-rejected sides
+            // emit nothing). The governor consumes these; it never
+            // synthesizes Blob entries.
+            let (outcome, prov) = resolve_file(&path, old, new)?;
+            view.blob_provenance.extend(prov);
+            match outcome {
                 FileOutcome::Skipped { path, reason } => {
                     view.skipped.push(SkippedFile { path, reason });
                 }
@@ -1212,7 +1239,9 @@ mod tests {
     #[test]
     fn resolve_file_skips_on_cap_rejection() {
         // Old side over cap: skip-with-warn, never fatal to the diff.
-        let r = resolve_file("big.bin", Err(cap_err()), Ok(vec![1, 2, 3])).unwrap();
+        // Nothing was read on the old side, so no provenance is emitted.
+        let (r, prov) =
+            resolve_file("big.bin", Some(Err(cap_err())), Some(Ok(vec![1, 2, 3]))).unwrap();
         match r {
             FileOutcome::Skipped { path, reason } => {
                 assert_eq!(path, "big.bin");
@@ -1220,21 +1249,34 @@ mod tests {
             }
             _ => panic!("expected Skipped"),
         }
-        // New side over cap: same.
-        let r = resolve_file("big.bin", Ok(vec![]), Err(cap_err())).unwrap();
+        assert!(prov.is_empty());
+        // New side over cap: same — but the old side WAS read, so its
+        // entry is honestly emitted before the skip.
+        let (r, prov) = resolve_file("big.bin", Some(Ok(vec![])), Some(Err(cap_err()))).unwrap();
         assert!(matches!(r, FileOutcome::Skipped { .. }));
+        assert_eq!(prov.len(), 1);
+        assert_eq!(prov[0].id, "big.bin");
     }
 
     #[test]
     fn resolve_file_fails_on_transport_error() {
         // Transport failures still fail the diff — only cap rejections skip.
-        let r = resolve_file("x", Err("artifacts GET https://x: 500".into()), Ok(vec![]));
+        let r = resolve_file(
+            "x",
+            Some(Err("artifacts GET https://x: 500".into())),
+            Some(Ok(vec![])),
+        );
         assert!(r.is_err());
     }
 
     #[test]
     fn resolve_file_measures_normal_pairs() {
-        let r = resolve_file("a.txt", Ok(b"a\n".to_vec()), Ok(b"b\n".to_vec())).unwrap();
+        let (r, prov) = resolve_file(
+            "a.txt",
+            Some(Ok(b"a\n".to_vec())),
+            Some(Ok(b"b\n".to_vec())),
+        )
+        .unwrap();
         match r {
             FileOutcome::Measured { change, bytes } => {
                 assert_eq!(change.path, "a.txt");
@@ -1243,5 +1285,45 @@ mod tests {
             }
             _ => panic!("expected Measured"),
         }
+        // Both sides read → two Blob entries, in side order.
+        assert_eq!(prov.len(), 2);
+        for e in &prov {
+            assert_eq!(e.kind, wreck_protocol::ProvenanceKind::Blob);
+            assert_eq!(e.id, "a.txt");
+        }
+        assert_eq!(prov[0].hash, wreck_protocol::sha256_hex(b"a\n"));
+        assert_eq!(prov[1].hash, wreck_protocol::sha256_hex(b"b\n"));
+    }
+
+    #[test]
+    fn resolve_file_provenance_reflects_actual_bytes_not_claimed() {
+        // Tamper case: the mocked fetch returns bytes that are NOT what
+        // the blob hash claimed. The entry must bind the ACTUAL bytes
+        // read — never an expected/claimed digest.
+        let tampered = b"tampered-content";
+        let expected = b"expected-content";
+        let (_, prov) = resolve_file(
+            "x.txt",
+            Some(Ok(tampered.to_vec())),
+            Some(Ok(expected.to_vec())),
+        )
+        .unwrap();
+        assert_eq!(prov.len(), 2);
+        assert_eq!(prov[0].hash, wreck_protocol::sha256_hex(tampered));
+        assert_eq!(prov[1].hash, wreck_protocol::sha256_hex(expected));
+        // The tampered side's entry does NOT match the "expected" digest:
+        // provenance records what was read, not what was requested.
+        assert_ne!(prov[0].hash, wreck_protocol::sha256_hex(expected));
+    }
+
+    #[test]
+    fn resolve_file_absent_side_emits_nothing() {
+        // Added file: old side absent → only the new side's read is
+        // recorded. Absence is never faked into an entry.
+        let (r, prov) = resolve_file("new.txt", None, Some(Ok(b"x".to_vec()))).unwrap();
+        assert!(matches!(r, FileOutcome::Measured { .. }));
+        assert_eq!(prov.len(), 1);
+        assert_eq!(prov[0].id, "new.txt");
+        assert_eq!(prov[0].hash, wreck_protocol::sha256_hex(b"x"));
     }
 }

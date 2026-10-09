@@ -60,6 +60,17 @@ pub struct ChangeView {
     /// of silently dropping evidence.
     #[serde(default)]
     pub skipped: Vec<SkippedFile>,
+    /// Blob provenance emitted by the fetch layer at read time
+    /// (cycle-19, observation-log pattern): one entry per blob whose bytes
+    /// were actually read to build this view — old and new sides each get
+    /// an entry, absent sides and cap-rejected sides get none. The hash
+    /// binds the exact bytes read, never a claimed digest. The governor
+    /// consumes these entries into the decision's provenance; it never
+    /// synthesizes Blob entries itself. Empty when the view was built
+    /// without blob fetches (e.g. local git plumbing) — honest absence,
+    /// not a gap to fill with guesses.
+    #[serde(default)]
+    pub blob_provenance: Vec<wreck_protocol::ProvenanceEntry>,
 }
 
 /// One file the adapter skipped measuring.

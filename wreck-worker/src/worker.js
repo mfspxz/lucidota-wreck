@@ -302,6 +302,12 @@ async function buildView(env, ev, after) {
   const oldBlobs = await treeBlobs(repo, ev.before);
   const newBlobs = await treeBlobs(repo, ev.after);
   const files = [];
+  // Cycle-19 (observation-log pattern): emit one Blob provenance entry
+  // per blob whose bytes were actually read — old and new sides each get
+  // an entry, absent sides get none. The hash binds the exact bytes the
+  // diff consumed (UTF-8 of the decoded text); the governor consumes
+  // these entries verbatim into the decision's provenance.
+  const blobProvenance = [];
   const paths = [...new Set([...oldBlobs.keys(), ...newBlobs.keys()])].sort();
   for (const path of paths) {
     const oh = oldBlobs.get(path);
@@ -311,9 +317,18 @@ async function buildView(env, ev, after) {
     // changed blob fully into isolate memory.
     const oldText = oh ? await readBlobCapped(repo, oh) : "";
     const newText = nh ? await readBlobCapped(repo, nh) : "";
+    if (oh) blobProvenance.push({ kind: "blob", id: path, hash: await sha256Hex(oldText) });
+    if (nh) blobProvenance.push({ kind: "blob", id: path, hash: await sha256Hex(newText) });
     files.push({ path, ...diffRanges(oldText, newText) });
   }
-  return { change_id: ev.repoName, files, symbols: [], invariants: [], contracts: [], dependencies: [] };
+  return { change_id: ev.repoName, files, symbols: [], invariants: [], contracts: [], dependencies: [], blob_provenance: blobProvenance };
+}
+
+/** Hex sha256 of a string's UTF-8 bytes — the bytes the diff consumed. */
+async function sha256Hex(text) {
+  const bytes = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /** Recursive tree walk via readTree (immediate children only).
@@ -493,4 +508,4 @@ async function notifyAgent(env, claim, decision) {
 
 // Named exports for unit tests (node --test). The default export above is
 // the Worker entrypoint.
-export { handlePush, handleMessage, claimFromCommit, treeBlobs, readBlobCapped, waitVisible, inFlightViews, mergedIds, activePolicy, initAuthorityKey, callWasm };
+export { handlePush, handleMessage, claimFromCommit, treeBlobs, readBlobCapped, buildView, waitVisible, inFlightViews, mergedIds, activePolicy, initAuthorityKey, callWasm };

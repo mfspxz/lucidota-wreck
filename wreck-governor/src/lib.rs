@@ -286,12 +286,18 @@ impl Governor {
         }
 
         // The scope-attestation check reads the measured view's files, so
-        // the view entry is recorded BEFORE it runs.
+        // the view entry is recorded BEFORE it runs. Cycle-19: the view
+        // may carry Blob entries emitted by the fetch layer (Worker or
+        // adapter) at read time — the governor CONSUMES them into the
+        // decision's provenance; it never synthesizes Blob entries itself
+        // (it has no blob bytes to bind). An empty blob_provenance is
+        // honest absence (e.g. views built from git plumbing), not a gap.
         prov.push(Self::prov_entry(
             ProvenanceKind::Diff,
             &view.change_id,
             wreck_protocol::content_hash(view)?,
         ));
+        prov.extend(view.blob_provenance.iter().cloned());
 
         // --- CHECKED: scope attestation (measured vs declared) ---
         if let Err(reason) = Self::check_scope_attestation(change, view) {
@@ -322,12 +328,16 @@ impl Governor {
                 continue;
             }
             // Record the view at classification time — a skipped (self)
-            // view is never recorded.
+            // view is never recorded. Cycle-19: consume the view's
+            // emitted Blob entries alongside the Diff entry, same rule
+            // as the own view — the reader's observations travel with
+            // the view, the governor never invents them.
             prov.push(Self::prov_entry(
                 ProvenanceKind::Diff,
                 &other.change_id,
                 wreck_protocol::content_hash(other)?,
             ));
+            prov.extend(other.blob_provenance.iter().cloned());
             conflicts.extend(classify(view, other, merged, &self.policy));
         }
         // dedup on (kind, with_change, detail)
@@ -1107,6 +1117,68 @@ mod tests {
             .unwrap();
         assert_eq!(claim.hash.len(), 64);
         assert!(claim.hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    // Cycle-19: the governor CONSUMES Blob entries emitted by the fetch
+    // layer (they ride the view) — it never synthesizes them. The
+    // entries arrive verbatim: the reader's observations, sealed with
+    // the decision.
+    #[test]
+    fn governor_consumes_emitted_blob_provenance() {
+        let (mut g, key) = gov();
+        let (mut c, mut v) = file_view("w-blob", "src/a.rs", vec![(1, 3)]);
+        // The fetch layer read two blobs to build this view; it emits
+        // entries binding the exact bytes read.
+        let old_bytes = b"fn a() {}\n";
+        let new_bytes = b"fn a() { 1 }\n";
+        v.blob_provenance = vec![
+            wreck_protocol::blob_provenance_entry("src/a.rs", old_bytes),
+            wreck_protocol::blob_provenance_entry("src/a.rs", new_bytes),
+        ];
+        let d = g
+            .evaluate(
+                &mut c,
+                &v,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T23:00:00Z",
+            )
+            .unwrap();
+        d.verify_receipt_with(&key).unwrap();
+        let blobs: Vec<&ProvenanceEntry> = d
+            .provenance
+            .iter()
+            .filter(|p| p.kind == ProvenanceKind::Blob)
+            .collect();
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(blobs[0].id, "src/a.rs");
+        assert_eq!(blobs[0].hash, wreck_protocol::sha256_hex(old_bytes));
+        assert_eq!(blobs[1].hash, wreck_protocol::sha256_hex(new_bytes));
+        // Verbatim: the governor did not re-hash, reorder, or invent.
+        let emitted: Vec<&ProvenanceEntry> = v.blob_provenance.iter().collect();
+        assert_eq!(blobs, emitted);
+    }
+
+    // Cycle-19: a view built without blob fetches (empty blob_provenance)
+    // yields a decision with no Blob entries — honest absence, never
+    // faked into existence by the governor.
+    #[test]
+    fn governor_synthesizes_no_blob_entries_without_emission() {
+        let (mut g, _) = gov();
+        let (mut c, v) = file_view("w-noblob", "src/b.rs", vec![(1, 3)]);
+        assert!(v.blob_provenance.is_empty());
+        let d = g
+            .evaluate(
+                &mut c,
+                &v,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T23:00:00Z",
+            )
+            .unwrap();
+        assert!(!d.provenance.iter().any(|p| p.kind == ProvenanceKind::Blob));
     }
 
     // Cycle-12: an early EVIDENCE-01 reject never reached the view, the
