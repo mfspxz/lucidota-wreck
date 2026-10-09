@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - name: clippy (zero warnings in wreck crates)
+        run: |
+          cargo clippy --workspace --all-targets --message-format=short 2>&1 | tee /tmp/clippy.log
+          if grep -E "wreck-(protocol|graph|governor|canon|adapters|demo|wasm)" /tmp/clippy.log | grep -q "warning"; then
+            echo "clippy warnings in wreck crates:"; grep -E "wreck-" /tmp/clippy.log | grep "warning" | head -10; exit 1
+          fi
+      - run: cargo test --workspace
+
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p wreck-demo 2>&1 | tail -5
+      - run: test -f /tmp/wreck-demo/dashboard.html

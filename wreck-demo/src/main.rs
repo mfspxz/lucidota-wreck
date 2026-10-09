@@ -21,6 +21,7 @@ use wreck_protocol::{
 
 mod dashboard;
 
+#[allow(clippy::vec_init_then_push)] // demo scaffolding: pushes in loops
 fn auth_baseline() -> Vec<String> {
     let mut lines: Vec<String> = vec![];
     lines.push("// auth.rs — baseline".into());

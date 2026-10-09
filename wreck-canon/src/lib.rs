@@ -22,6 +22,10 @@ pub struct CanonRule {
     pub supersedes: Option<String>,
     /// the contract scope this rule forbids touching (for policy use)
     pub forbids_contract: Option<String>,
+    /// file path patterns that imply touching the forbidden contract,
+    /// measured from the diff (see PolicyRule::file_patterns).
+    #[serde(default)]
+    pub contract_file_patterns: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -79,6 +83,7 @@ impl CanonStore {
                         id: r.id.clone(),
                         forbidden_contract: c.clone(),
                         reason: format!("{} (authority: {})", r.statement, r.authority),
+                        file_patterns: r.contract_file_patterns.clone(),
                     })
                 })
                 .collect(),
@@ -96,6 +101,10 @@ pub fn demo_canon() -> CanonStore {
         created: "2026-10-08".into(),
         supersedes: None,
         forbids_contract: Some("auth.error-semantics".into()),
+        // REDTEAM (spree A2): measured from the diff — an agent cannot
+        // bypass by omitting the contract declaration.
+        // Specific to error-semantics files, not all auth files.
+        contract_file_patterns: vec!["src/auth_err*".into()],
     });
     s.insert(CanonRule {
         id: "CANON-17".into(),
@@ -104,6 +113,7 @@ pub fn demo_canon() -> CanonStore {
         created: "2026-10-08".into(),
         supersedes: None,
         forbids_contract: None,
+        contract_file_patterns: vec![],
     });
     s
 }
@@ -122,6 +132,7 @@ mod tests {
             created: "2026-10-09".into(),
             supersedes: Some("CANON-31".into()),
             forbids_contract: Some("auth.error-semantics".into()),
+            contract_file_patterns: vec!["src/auth*".into()],
         });
         // old rule still retrievable (history), but not active
         assert!(s.get("CANON-31").is_some());

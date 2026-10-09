@@ -28,6 +28,18 @@ Git records **WHAT** happened. wreck records **WHY it was allowed to happen**:
 An agent doesn't open a PR. It proposes a **change claim** — a state
 transition with intent, semantic claims, and evidence:
 
+```mermaid
+flowchart TD
+    A[Agent works in fork] --> B[Push]
+    B --> C{Governor}
+    C --> D[Evidence gate]
+    D --> E[CANON policy check]
+    E --> F[Conflict graph]
+    F -->|clean| G[ACCEPT → merge → sealed receipt]
+    F -->|conflict| H[REJECT → machine-readable reason]
+    F -->|dependency| I[BLOCKED → retried, never lost]
+```
+
 ```
 TASK → fork (repo per agent) → agent works → push
   → push event → governor → CHANGE CLAIM
@@ -77,15 +89,17 @@ extraction, semantic hints), never the judge.
 
 ## Reproduce it
 
-Requires: Rust toolchain, git.
+Requires: Rust toolchain, git, C compiler (clang or gcc).
 
 ```sh
-cargo test --workspace          # 25 tests, all green
+cargo test --workspace          # 119 tests, all green
 cargo run -p wreck-demo         # the 5-agent nasty scenario
 # → A,B,E merged · C rejected (textual+semantic) · D rejected (policy)
 # → dashboard at /tmp/wreck-demo/dashboard.html
 cargo run -p wreck-demo --bin wreck-scale 50   # 50 agents, 8+ decisions/sec
-cargo build -p wreck-wasm --target wasm32-unknown-unknown  # Worker core
+# WASM build needs a C compiler; if cc-rs can't find clang, use:
+CC=gcc cargo build -p wreck-wasm --target wasm32-unknown-unknown  # Worker core
+# Note: needs CC=gcc on systems without clang (cc-rs default)
 ```
 
 Sample dashboard: `docs/dashboard-sample.html`.

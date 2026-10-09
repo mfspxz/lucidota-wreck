@@ -371,6 +371,7 @@ pub struct DecisionRecord {
 
 impl DecisionRecord {
     /// Build an unsealed decision (receipt empty). `seal` attaches the envelope.
+    #[allow(clippy::too_many_arguments)] // builder-style ctor; fields are distinct
     pub fn draft(
         change: &ChangeClaim,
         verdict: Verdict,

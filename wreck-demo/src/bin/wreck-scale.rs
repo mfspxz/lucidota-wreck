@@ -13,9 +13,7 @@ use std::time::Instant;
 use wreck_adapters::{LocalGit, LocalMergePort};
 use wreck_governor::Governor;
 use wreck_graph::ChangeView;
-use wreck_protocol::{
-    ChangeClaim, Claim, ClaimKind, Evidence, EvidenceKind, ScopeItem, Sha, Verdict,
-};
+use wreck_protocol::{ChangeClaim, Claim, ClaimKind, Evidence, EvidenceKind, ScopeItem, Verdict};
 
 fn baseline(nfiles: usize, lines_per: usize) -> Vec<(String, String)> {
     (0..nfiles)

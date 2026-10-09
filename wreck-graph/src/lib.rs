@@ -112,6 +112,26 @@ pub struct PolicyRule {
     pub id: String,
     pub forbidden_contract: String,
     pub reason: String,
+    /// File path patterns that IMPLY touching this contract, measured from
+    /// the diff — not agent-declared. Supports `*` suffix for prefix match
+    /// (e.g. "src/auth*") and exact match otherwise. Empty = no measurement
+    /// (relies on honest declaration; documented limitation).
+    /// REDTEAM (spree A2): without this, a malicious agent bypasses the
+    /// policy by omitting the contract from scope — the governor never
+    /// measured contracts from the diff.
+    #[serde(default)]
+    pub file_patterns: Vec<String>,
+}
+
+/// Does `path` match any of `patterns`? `*` suffix = prefix match.
+pub fn file_matches_patterns(path: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|p| {
+        if let Some(prefix) = p.strip_suffix('*') {
+            path.starts_with(prefix)
+        } else {
+            path == p
+        }
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -133,18 +153,23 @@ pub fn classify(
     //    forbidden contract is rejected regardless of the other change.
     //    Only the SUBJECT's contracts are checked — never attribute b's
     //    violation to a (that was a real bug: E got rejected for D's sin).
+    //    REDTEAM (spree A2): also measure from the diff — a file matching
+    //    the rule's patterns implies the contract, even if undeclared.
     for rule in &policy.rules {
-        for c in &a.contracts {
-            if *c == rule.forbidden_contract {
-                out.push(ConflictRef {
-                    with_change: "POLICY".to_string(),
-                    kind: ConflictKind::Policy,
-                    detail: format!(
-                        "rule {} forbids touching contract {}: {}",
-                        rule.id, rule.forbidden_contract, rule.reason
-                    ),
-                });
-            }
+        let declared = a.contracts.contains(&rule.forbidden_contract);
+        let measured = a
+            .files
+            .iter()
+            .any(|f| file_matches_patterns(&f.path, &rule.file_patterns));
+        if declared || measured {
+            out.push(ConflictRef {
+                with_change: "POLICY".to_string(),
+                kind: ConflictKind::Policy,
+                detail: format!(
+                    "rule {} forbids touching contract {}: {}",
+                    rule.id, rule.forbidden_contract, rule.reason
+                ),
+            });
         }
     }
 
@@ -222,7 +247,7 @@ pub fn build_candidate(
         let mut conflicts = vec![];
         // policy self-check (classify reports it per pair; do it once here)
         for rule in &policy.rules {
-            if v.contracts.iter().any(|c| *c == rule.forbidden_contract) {
+            if v.contracts.contains(&rule.forbidden_contract) {
                 conflicts.push(ConflictRef {
                     with_change: "POLICY".to_string(),
                     kind: ConflictKind::Policy,
@@ -398,6 +423,9 @@ mod tests {
                 id: "CANON-31".into(),
                 forbidden_contract: "auth.error-semantics".into(),
                 reason: "contract C-17 prohibits mutation of auth error semantics".into(),
+                // Specific to error-semantics files, not all auth files.
+                // src/auth.rs (token validation) is legitimate; src/auth_err.rs is not.
+                file_patterns: vec!["src/auth_err*".into()],
             }],
         }
     }
@@ -529,10 +557,8 @@ pub fn enclosing_functions(source: &str, ranges: &[(u32, u32)]) -> Vec<String> {
         if let (Some(n), Some(f)) = (name, fnode) {
             let start = f.start_position().row as u32 + 1; // 1-indexed
             let end = f.end_position().row as u32 + 1;
-            if ranges.iter().any(|(s, e)| *s <= end && start <= *e) {
-                if !out.contains(&n) {
-                    out.push(n);
-                }
+            if ranges.iter().any(|(s, e)| *s <= end && start <= *e) && !out.contains(&n) {
+                out.push(n);
             }
         }
     }

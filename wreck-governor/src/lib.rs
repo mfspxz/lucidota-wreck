@@ -362,9 +362,15 @@ impl Governor {
                 &rule.id,
                 wreck_protocol::content_hash(rule)?,
             ));
-            if view.contracts.iter().any(|c| *c == rule.forbidden_contract)
-                && !conflicts.iter().any(|c| c.kind == ConflictKind::Policy)
-            {
+            // REDTEAM (spree A2): measure contracts from the diff, not just
+            // agent declarations. A file matching the rule's patterns IMPLIES
+            // touching the forbidden contract — the agent cannot omit it.
+            let declared = view.contracts.contains(&rule.forbidden_contract);
+            let measured = view
+                .files
+                .iter()
+                .any(|f| wreck_graph::file_matches_patterns(&f.path, &rule.file_patterns));
+            if (declared || measured) && !conflicts.iter().any(|c| c.kind == ConflictKind::Policy) {
                 conflicts.push(ConflictRef {
                     with_change: "POLICY".to_string(),
                     kind: ConflictKind::Policy,
@@ -552,6 +558,7 @@ mod tests {
                 id: "CANON-31".into(),
                 forbidden_contract: "auth.error-semantics".into(),
                 reason: "C-17".into(),
+                file_patterns: vec![],
             }],
         }
     }
@@ -1106,6 +1113,7 @@ mod tests {
                 id: "CANON-31".into(),
                 forbidden_contract: "auth.error-semantics".into(),
                 reason: "C-17".into(),
+                file_patterns: vec![],
             })
             .unwrap()
         );
@@ -1301,5 +1309,180 @@ mod attestation_tests {
             }
             v => panic!("expected SCOPE-01 reject, got {:?}", v),
         }
+    }
+}
+
+#[cfg(test)]
+mod redteam_contract_bypass {
+    //! RED TEAM (Agent 2, spree): contract policy bypass via undeclared contract.
+    //! A malicious agent modifies src/auth.rs (governs auth.error-semantics)
+    //! but declares ONLY the file, omitting the contract from scope.
+    //! The governor's policy check reads view.contracts (agent-declared);
+    //! it never measures contracts from the diff. PROVEN below.
+
+    use super::*;
+    use wreck_graph::{FileChange, PolicyRule};
+    use wreck_protocol::{Claim, ClaimKind, Evidence, EvidenceKind, ScopeItem};
+
+    struct FakeMerger;
+    impl MergePort for FakeMerger {
+        fn merge(&self, _c: &ChangeClaim) -> Result<Sha, String> {
+            Sha::new(&"f".repeat(40))
+        }
+        fn name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    #[test]
+    fn contract_policy_bypass_proven() {
+        let policy = Policy {
+            rules: vec![PolicyRule {
+                id: "CANON-31".into(),
+                forbidden_contract: "auth.error-semantics".into(),
+                reason: "C-17".into(),
+                // The hardening: this pattern is MEASURED from the diff.
+                // The agent cannot omit it.
+                file_patterns: vec!["src/auth_err*".into()],
+            }],
+        };
+        let key = b"test-key-32-bytes-long-padding!!".to_vec();
+        let mut gov = Governor::new(policy, key, "governor-test");
+
+        let mut c = ChangeClaim::propose(
+            "w-evil",
+            "agent-malicious",
+            "t1",
+            Sha::new(&"a".repeat(40)).unwrap(),
+            Sha::new(&"b".repeat(40)).unwrap(),
+            "innocent auth tweak",
+        )
+        .expect("valid change_id");
+        // Malicious: declares the file (passes scope attestation) but
+        // OMITS the contract declaration.
+        c.scope = vec![ScopeItem::File {
+            path: "src/auth_err.rs".into(),
+        }];
+        c.claims.push(Claim {
+            id: "C1".into(),
+            statement: "safe".into(),
+            kind: ClaimKind::PreservesApi,
+        });
+        c.evidence.push(Evidence {
+            id: "C1-E1".into(),
+            kind: EvidenceKind::Test,
+            reference: "C1: tests pass".into(),
+            digest: "sha256:fake".into(),
+        });
+        let v = ChangeView {
+            change_id: "w-evil".into(),
+            files: vec![FileChange {
+                path: "src/auth_err.rs".into(),
+                added: vec![(1, 50)],
+                removed: vec![],
+            }],
+            ..Default::default()
+        };
+        assert!(v.contracts.is_empty());
+
+        let d = gov
+            .evaluate(
+                &mut c,
+                &v,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T23:00:00Z",
+            )
+            .unwrap();
+
+        // HARDENED (spree A2): the file pattern is measured from the diff.
+        // The malicious change MUST now be rejected, even though the agent
+        // omitted the contract declaration.
+        match &d.verdict {
+            Verdict::Accept => {
+                panic!("REDTEAM FAILED: contract policy bypassed, malicious change ACCEPTED");
+            }
+            Verdict::Reject { reason, rule } => {
+                assert!(
+                    rule.contains("CANON-31"),
+                    "should cite the policy rule, got: {}",
+                    rule
+                );
+                assert!(reason.contains("policy violation"), "reason: {}", reason);
+                println!(
+                    "REDTEAM HARDENED: correctly rejected: {} ({})",
+                    reason, rule
+                );
+            }
+            v => panic!("Unexpected verdict: {:?}", v),
+        }
+    }
+
+    #[test]
+    fn contract_policy_bypass_without_patterns_still_relies_on_declaration() {
+        // Document the residual limitation: if a rule has NO file_patterns,
+        // the governor still relies on honest declaration. This is a
+        // documented gap, not a silent bypass.
+        let policy = Policy {
+            rules: vec![PolicyRule {
+                id: "CANON-99".into(),
+                forbidden_contract: "some.contract".into(),
+                reason: "test".into(),
+                file_patterns: vec![], // no measurement configured
+            }],
+        };
+        let key = b"test-key-32-bytes-long-padding!!".to_vec();
+        let mut gov = Governor::new(policy, key, "governor-test");
+
+        let mut c = ChangeClaim::propose(
+            "w-evil2",
+            "agent-malicious",
+            "t1",
+            Sha::new(&"a".repeat(40)).unwrap(),
+            Sha::new(&"b".repeat(40)).unwrap(),
+            "x",
+        )
+        .expect("valid change_id");
+        c.scope = vec![ScopeItem::File {
+            path: "src/other.rs".into(),
+        }];
+        c.claims.push(Claim {
+            id: "C1".into(),
+            statement: "s".into(),
+            kind: ClaimKind::PreservesApi,
+        });
+        c.evidence.push(Evidence {
+            id: "C1-E1".into(),
+            kind: EvidenceKind::Test,
+            reference: "C1: t".into(),
+            digest: "sha256:x".into(),
+        });
+        let v = ChangeView {
+            change_id: "w-evil2".into(),
+            files: vec![FileChange {
+                path: "src/other.rs".into(),
+                added: vec![(1, 10)],
+                removed: vec![],
+            }],
+            ..Default::default()
+        };
+        let d = gov
+            .evaluate(
+                &mut c,
+                &v,
+                &[],
+                &HashSet::new(),
+                &FakeMerger,
+                "2026-10-08T23:00:00Z",
+            )
+            .unwrap();
+        // Without patterns, an undeclared contract is not caught — this
+        // documents the limitation. Operators MUST configure patterns for
+        // every forbidden contract.
+        assert!(
+            matches!(d.verdict, Verdict::Accept),
+            "documents the residual gap: undeclared contract with no patterns is not caught"
+        );
     }
 }

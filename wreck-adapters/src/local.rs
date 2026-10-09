@@ -30,8 +30,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// (added ranges, removed ranges) from a -U0 diff.
+type DiffRanges = (Vec<(u32, u32)>, Vec<(u32, u32)>);
+
 /// Parse `git diff -U0` hunk headers into added/removed ranges.
-fn parse_unified_zero(diff: &str) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
+fn parse_unified_zero(diff: &str) -> DiffRanges {
     let mut added = vec![];
     let mut removed = vec![];
     for line in diff.lines() {

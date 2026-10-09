@@ -703,9 +703,12 @@ fn write_blob_file(path: &Path, data: &[u8]) -> Result<(), String> {
 }
 
 /// Compute added/removed line ranges between two blob texts via git.
+/// (added ranges, removed ranges) from a -U0 diff.
+type DiffRanges = (Vec<(u32, u32)>, Vec<(u32, u32)>);
+
 /// (Shells to git --no-index: the same -U0 parser as the local adapter,
 /// one implementation of the diff semantics.)
-fn diff_ranges(old: &[u8], new: &[u8]) -> Result<(Vec<(u32, u32)>, Vec<(u32, u32)>), String> {
+fn diff_ranges(old: &[u8], new: &[u8]) -> Result<DiffRanges, String> {
     let dir = make_diff_dir()?;
     write_blob_file(&dir.join("a"), old)?;
     write_blob_file(&dir.join("b"), new)?;
@@ -720,7 +723,7 @@ fn diff_ranges(old: &[u8], new: &[u8]) -> Result<(Vec<(u32, u32)>, Vec<(u32, u32
     Ok(parse_unified_zero(&text))
 }
 
-fn parse_unified_zero(diff: &str) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
+fn parse_unified_zero(diff: &str) -> DiffRanges {
     let mut added = vec![];
     let mut removed = vec![];
     for line in diff.lines() {
@@ -1216,7 +1219,7 @@ mod tests {
 
     #[test]
     fn user_inventory_hides_internal_tokens() {
-        let tokens = vec![
+        let tokens = [
             tok("u1", Some("write"), Some("active")), // user-held: shown
             tok("i1", Some("read"), Some("active")),  // custodian read token: hidden
             tok("u2", Some("write"), Some("expired")), // dead grant: hidden
@@ -1228,7 +1231,7 @@ mod tests {
             .filter(|t| is_user_held(t))
             .map(|t| t.id.clone())
             .collect();
-        assert_eq!(shown, vec!["u1".to_string()]);
+        assert_eq!(shown, ["u1".to_string()]);
     }
 
     fn cap_err() -> String {
