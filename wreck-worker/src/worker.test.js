@@ -8,6 +8,7 @@ import {
   activePolicy,
   buildView,
   callWasm,
+  checkWasmOutputShape,
   claimFromCommit,
   handleMessage,
   handlePush,
@@ -326,7 +327,14 @@ function mockWasm() {
     },
     wreck_decide(inPtr, inLen, outPtr, outCap) {
       const input = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, inPtr, inLen)));
-      const out = JSON.stringify({ outcome: "decided", gotIntent: input.claim?.intent ?? null });
+      // conforming decide shape (A2): the caller-side schema check rejects
+      // anything else
+      const out = JSON.stringify({
+        claim: input.claim ?? {},
+        outcome: "decided",
+        draft: null,
+        decision: { verdict: "accept", claim_id: input.claim?.intent ?? null },
+      });
       const bytes = new TextEncoder().encode(out);
       new Uint8Array(buffer, outPtr, bytes.length).set(bytes);
       return bytes.length;
@@ -347,7 +355,8 @@ test("M6: callWasm allocates per call and frees everything", () => {
   const w = mockWasm();
   const out = callWasm(w, "wreck_decide", { claim: { intent: "hi" } });
   assert.equal(out.outcome, "decided");
-  assert.equal(out.gotIntent, "hi");
+  assert.equal(out.claim.intent, "hi");
+  assert.equal(out.decision.claim_id, "hi");
   // one input alloc + one output alloc, both freed, no overlap
   assert.equal(w.allocs.length, 2);
   assert.equal(w.frees.length, 2);
@@ -377,6 +386,69 @@ test("M6: callWasm fails closed on missing exports and oversized input", () => {
     "input cap must fire before alloc",
   );
   assert.throws(() => callWasm(w, "wreck_tiny", {}), /output too small/);
+});
+
+// ---------- A2: caller-side output schema check (capnweb validateStub) ----------
+
+test("A2: checkWasmOutputShape accepts conforming decide/complete outputs", () => {
+  assert.deepEqual(
+    checkWasmOutputShape("wreck_decide", {
+      claim: {}, outcome: "decided", draft: null, decision: { verdict: "accept" },
+    }).outcome,
+    "decided",
+  );
+  assert.deepEqual(
+    checkWasmOutputShape("wreck_decide", {
+      claim: {}, outcome: "accept_pending", draft: { change_id: "t" }, decision: null,
+    }).outcome,
+    "accept_pending",
+  );
+  assert.deepEqual(
+    checkWasmOutputShape("wreck_complete", { claim: {}, decision: { verdict: "merged" } }).decision.verdict,
+    "merged",
+  );
+});
+
+test("A2: checkWasmOutputShape rejects malformed outputs fail-closed", () => {
+  const bad = [
+    [{ outcome: "decided" }, "missing/invalid claim"], // no claim
+    ["not an object", "not an object"],
+    [null, "not an object"],
+    [[], "not an object"],
+    [{ claim: {}, outcome: "maybe", decision: {} }, "bad outcome"], // unknown outcome
+    [{ claim: {}, outcome: "decided", decision: null }, "decided without a decision"], // missing decision
+    [{ claim: {}, outcome: "accept_pending", draft: null }, "accept_pending without a draft"], // missing draft
+    [{ claim: {}, outcome: "decided", decision: "yes" }, "decided without a decision"], // wrong type
+  ];
+  for (const [v, why] of bad) {
+    assert.throws(() => checkWasmOutputShape("wreck_decide", v), /malformed output/, `should reject: ${why}`);
+  }
+  assert.throws(
+    () => checkWasmOutputShape("wreck_complete", { claim: {} }),
+    /missing\/invalid decision/,
+  );
+});
+
+test("A2: callWasm rejects a WASM module that returns the wrong shape", () => {
+  // a hostile or buggy WASM build returning valid JSON of the wrong shape
+  // must fail closed in callWasm, not flow into the governor path
+  const buffer = new ArrayBuffer(1 << 20);
+  let next = 4096;
+  const w = {
+    memory: { buffer },
+    wreck_alloc(size) { const p = next; next += size; return p; },
+    wreck_free() { return 0; },
+    wreck_decide(inPtr, inLen, outPtr, outCap) {
+      const bytes = new TextEncoder().encode(JSON.stringify({ outcome: "decided" })); // no claim!
+      new Uint8Array(buffer, outPtr, bytes.length).set(bytes);
+      return bytes.length;
+    },
+  };
+  assert.throws(
+    () => callWasm(w, "wreck_decide", { claim: {} }),
+    /malformed output.*missing\/invalid claim/,
+    "shape check must fire on the WASM-returned JSON",
+  );
 });
 
 // ---------- L1: no unauthenticated catch-all ----------

@@ -54,12 +54,43 @@ async function getWasm() {
 }
 
 /**
+ * A2 (cycle-21, capnweb validateStub analog): caller-side schema check on
+ * WASM outputs. callWasm used to trust JSON.parse with no shape
+ * validation — a malformed/truncated decision object flowed straight into
+ * the governor path. Now every parsed output is checked against the shape
+ * its entry point promises; anything else fails closed, never flows on.
+ */
+export function checkWasmOutputShape(fn, v) {
+  const fail = (why) => {
+    throw new Error(`wreck: ${fn} returned malformed output: ${why}`);
+  };
+  const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
+  if (!isObj(v)) fail("not an object");
+  if (!isObj(v.claim)) fail("missing/invalid claim");
+  if (fn === "wreck_decide") {
+    if (v.outcome !== "accept_pending" && v.outcome !== "decided") {
+      fail(`bad outcome: ${JSON.stringify(v.outcome)}`);
+    }
+    if (v.outcome === "accept_pending" && !isObj(v.draft)) {
+      fail("accept_pending without a draft object");
+    }
+    if (v.outcome === "decided" && !isObj(v.decision)) {
+      fail("decided without a decision object");
+    }
+  } else if (fn === "wreck_complete") {
+    if (!isObj(v.decision)) fail("missing/invalid decision");
+  }
+  // unknown entry points have no promised shape — pass through
+  return v;
+}
+
+/**
  * M6 (cycle-06 audit): per-call allocation via the WASM module's own
  * wreck_alloc/wreck_free — no fixed regions, no cross-call aliasing.
  * Buffers are freed after every call (success or failure). A null alloc
  * or a missing export fails closed: the call never proceeds.
  */
-function callWasm(w, fn, inputObj, outCap = 65536) {
+export function callWasm(w, fn, inputObj, outCap = 65536) {
   const input = new TextEncoder().encode(JSON.stringify(inputObj));
   // cap before the WASM boundary: 1 MiB, reject-never-truncate
   checkCap(input.length, WASM_INPUT_CAP, `wasm ${fn} input`);
@@ -88,7 +119,10 @@ function callWasm(w, fn, inputObj, outCap = 65536) {
       const raw = new TextDecoder().decode(mem().subarray(outPtr, outPtr + outCap));
       throw new Error(`wreck: ${fn} failed (${rc}): ${raw.split("\0")[0]}`);
     }
-    return JSON.parse(new TextDecoder().decode(mem().subarray(outPtr, outPtr + rc)));
+    // A2: validate the WASM output's shape before it flows anywhere —
+    // a malformed decision object must fail closed here, not downstream.
+    const parsed = JSON.parse(new TextDecoder().decode(mem().subarray(outPtr, outPtr + rc)));
+    return checkWasmOutputShape(fn, parsed);
   } finally {
     w.wreck_free(inPtr, input.length);
     w.wreck_free(outPtr, outCap);
@@ -508,4 +542,4 @@ async function notifyAgent(env, claim, decision) {
 
 // Named exports for unit tests (node --test). The default export above is
 // the Worker entrypoint.
-export { handlePush, handleMessage, claimFromCommit, treeBlobs, readBlobCapped, buildView, waitVisible, inFlightViews, mergedIds, activePolicy, initAuthorityKey, callWasm };
+export { handlePush, handleMessage, claimFromCommit, treeBlobs, readBlobCapped, buildView, waitVisible, inFlightViews, mergedIds, activePolicy, initAuthorityKey };

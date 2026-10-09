@@ -180,6 +180,13 @@ fn run_complete(input: &[u8]) -> Result<Vec<u8>, String> {
 /// are small by design; anything larger is a bug or an attack.
 pub const MAX_INPUT_BYTES: usize = 1_048_576;
 
+/// Max JSON nesting depth for ABI inputs (A1, capnweb maxDepth analog —
+/// cloudflare/capnweb src/serialize.ts: maxDepth 256). serde_json's own
+/// recursion limit is 128 and unpinned; a 1 MiB deeply-nested input is
+/// exactly the attack maxDepth exists for. 64 is far above any honest
+/// claim/view shape.
+pub const MAX_JSON_DEPTH: usize = 64;
+
 /// Pure cap check, unit-testable. Called before the input slice is viewed.
 fn check_input_cap(input_len: usize) -> Result<(), String> {
     if input_len > MAX_INPUT_BYTES {
@@ -189,6 +196,57 @@ fn check_input_cap(input_len: usize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Pure nesting-depth check, unit-testable. Scans the raw bytes with
+/// string/escape awareness (braces inside strings never count) and runs
+/// BEFORE serde touches the input — a deep-nesting bomb is rejected
+/// without ever entering the parser's recursion.
+fn check_input_depth(input: &[u8]) -> Result<(), String> {
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in input {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > MAX_JSON_DEPTH {
+                    return Err(format!(
+                        "wreck: input nesting depth {} exceeds {} (reject-never-truncate)",
+                        depth, MAX_JSON_DEPTH
+                    ));
+                }
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Central error-envelope constructor (A3, capnweb onSendError analog).
+/// EVERY WASM error path goes through here — never ad hoc. The envelope
+/// carries only the message string; it cannot carry key material because
+/// the authority key is never an argument and is never interpolated.
+/// Deliberately not a hook: wreck has no sessions and a single trust
+/// domain, so a hook is machinery without a second user — the
+/// constructor + the no-key-bytes test is the honest equivalent.
+fn error_envelope(msg: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "error": msg }))
+        .unwrap_or_else(|_| b"{\"error\":\"wreck: envelope serialization failed\"}".to_vec())
 }
 
 fn call(
@@ -204,6 +262,7 @@ fn call(
         }
         check_input_cap(input_len)?;
         let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+        check_input_depth(input)?;
         f(input)
     })();
     match result {
@@ -217,8 +276,9 @@ fn call(
             bytes.len() as i32
         }
         Err(e) => {
-            let msg = format!("{{\"error\":{}}}", serde_json::Value::String(e));
-            let b = msg.as_bytes();
+            // A3: the envelope is built by the central constructor — the
+            // only place that serializes errors for the host.
+            let b = error_envelope(&e);
             if b.len() <= out_cap {
                 unsafe {
                     // NUL-fill first: the host reads the error as a
@@ -482,6 +542,148 @@ mod cap_tests {
         assert_eq!(rc, -1);
         let msg = std::str::from_utf8(&out[..512]).unwrap();
         assert!(msg.contains("decide input"), "out: {}", msg);
+    }
+}
+
+#[cfg(test)]
+mod a1_depth_tests {
+    use super::*;
+
+    fn nested(depth: usize) -> Vec<u8> {
+        let mut v = vec![b'['; depth];
+        v.extend(vec![b']'; depth]);
+        v
+    }
+
+    #[test]
+    fn depth_at_bound_passes() {
+        assert!(check_input_depth(&nested(MAX_JSON_DEPTH)).is_ok());
+    }
+
+    #[test]
+    fn depth_100_rejected_by_our_bound_not_serdes() {
+        // 100 < serde_json's 128-deep recursion limit: serde would ACCEPT
+        // this, so a rejection proves OUR bound fires first.
+        let err = check_input_depth(&nested(100)).unwrap_err();
+        assert!(err.contains("depth"), "err: {}", err);
+        assert!(err.contains("reject-never-truncate"), "err: {}", err);
+    }
+
+    #[test]
+    fn depth_200_rejected() {
+        let err = check_input_depth(&nested(200)).unwrap_err();
+        assert!(err.contains("depth"), "err: {}", err);
+    }
+
+    #[test]
+    fn call_rejects_deep_input_with_depth_error() {
+        let deep = nested(100);
+        let mut out = vec![0u8; 4096];
+        let rc = call(
+            deep.as_ptr(),
+            deep.len(),
+            out.as_mut_ptr(),
+            out.len(),
+            run_decide,
+        );
+        assert_eq!(rc, -1);
+        let msg = std::str::from_utf8(&out[..512]).unwrap();
+        assert!(msg.starts_with("{\"error\":"), "out: {}", msg);
+        assert!(msg.contains("depth"), "must be a depth rejection: {}", msg);
+    }
+
+    #[test]
+    fn depth_bound_does_not_fire_on_shallow_input() {
+        // 64-deep is valid JSON; serde must be the thing that rejects it
+        // (missing struct fields), not the depth check.
+        let shallow = nested(MAX_JSON_DEPTH);
+        let mut out = vec![0u8; 4096];
+        let rc = call(
+            shallow.as_ptr(),
+            shallow.len(),
+            out.as_mut_ptr(),
+            out.len(),
+            run_decide,
+        );
+        assert_eq!(rc, -1);
+        let msg = std::str::from_utf8(&out[..512]).unwrap();
+        assert!(msg.contains("decide input"), "out: {}", msg);
+        assert!(!msg.contains("depth"), "depth check must not fire: {}", msg);
+    }
+
+    #[test]
+    fn braces_inside_strings_do_not_count() {
+        // 200 brackets inside a JSON string value: depth stays 1
+        let v = format!("{{\"k\": \"{}\"}}", "[".repeat(200));
+        assert!(check_input_depth(v.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn escaped_quotes_do_not_break_the_scanner() {
+        // the \" keeps the string open, so the [ after it is inside the string
+        let v = b"{\"k\": \"a\\\"b[c\"}".to_vec();
+        assert!(check_input_depth(&v).is_ok());
+        // sanity: without the escape the bracket WOULD count
+        let v2 = b"{\"k\": \"a\", \"b\": [}".to_vec();
+        assert!(check_input_depth(&v2).is_ok()); // depth 1, fine
+        let deep_in_string = format!("{{\"k\": \"a\\\"{}\"}}", "[".repeat(200));
+        assert!(check_input_depth(deep_in_string.as_bytes()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod a3_envelope_tests {
+    use super::*;
+
+    #[test]
+    fn error_envelope_is_valid_json_with_error_field() {
+        let b = error_envelope("say \"hi\"\nbye");
+        let v: serde_json::Value = serde_json::from_slice(&b).expect("valid json");
+        assert_eq!(v["error"], "say \"hi\"\nbye");
+    }
+
+    #[test]
+    fn error_envelope_never_carries_key_bytes() {
+        // A3 core: install a distinctive key, feed the key itself as the
+        // (invalid) decide input, and prove the error envelope that comes
+        // back contains no key material.
+        let _guard = TEST_SERIAL.lock().unwrap();
+        let key = b"KEYMAT-0123456789abcdef-KEYMAT-0123!!";
+        uninstall_key_for_tests();
+        let rc = unsafe { wreck_init_key(key.as_ptr(), key.len()) };
+        assert_eq!(rc, 0);
+        let mut out = vec![0u8; 4096];
+        let rc = call(
+            key.as_ptr(),
+            key.len(),
+            out.as_mut_ptr(),
+            out.len(),
+            run_decide,
+        );
+        assert_eq!(rc, -1);
+        let msg = String::from_utf8_lossy(&out);
+        assert!(msg.starts_with("{\"error\":"), "out: {}", msg);
+        assert!(
+            !msg.contains("KEYMAT"),
+            "envelope leaks key material: {}",
+            msg
+        );
+        uninstall_key_for_tests();
+    }
+
+    #[test]
+    fn error_envelope_path_used_by_call() {
+        // the error the host sees is exactly what the central
+        // constructor produces — one code path, no ad hoc envelopes
+        let direct = error_envelope("decide input: boom");
+        let direct_s = std::str::from_utf8(&direct).unwrap();
+        let mut out = vec![0u8; 4096];
+        let rc = call(b"{".as_ptr(), 1, out.as_mut_ptr(), out.len(), |_| {
+            Err::<Vec<u8>, String>("decide input: boom".into())
+        });
+        assert_eq!(rc, -1);
+        let seen = std::str::from_utf8(&out[..direct_s.len()]).unwrap();
+        assert_eq!(seen, direct_s, "call() must use error_envelope()");
     }
 }
 
