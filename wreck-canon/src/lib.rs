@@ -24,6 +24,16 @@ pub struct CanonRule {
     pub forbids_contract: Option<String>,
     /// file path patterns that imply touching the forbidden contract,
     /// measured from the diff (see PolicyRule::file_patterns).
+    ///
+    /// HONEST BOUND (R-2, 2026-10-10): this is a HEURISTIC, not a proof of
+    /// contract impact. It catches: the obvious case — an agent touching
+    /// files under the listed patterns while omitting the contract from
+    /// scope (RT-A2-001). It does NOT catch: contract violations via files
+    /// outside the listed patterns (behavioral coupling across modules),
+    /// violations with no diff at all (config/env/runtime changes), or an
+    /// agent that correctly declares the contract but violates its spirit.
+    /// Patterns are curated by the operator, not discovered; coverage beyond
+    /// the listed patterns is UNKNOWN, never assumed.
     #[serde(default)]
     pub contract_file_patterns: Vec<String>,
 }
