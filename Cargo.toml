@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["wreck-protocol", "wreck-graph", "wreck-governor", "wreck-adapters", "wreck-demo", "wreck-canon", "wreck-wasm"]
+members = ["wreck-protocol", "wreck-graph", "wreck-governor", "wreck-adapters", "wreck-demo", "wreck-canon", "wreck-wasm", "wreck-organelles"]

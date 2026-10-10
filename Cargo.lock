@@ -859,6 +859,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "organelle-host"
+version = "1.0.0"
+dependencies = [
+ "hex",
+ "organelle-manifest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "organelle-manifest"
+version = "1.0.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -888,6 +909,8 @@ dependencies = [
  "hkdf",
  "indexmap",
  "jiff",
+ "organelle-host",
+ "organelle-manifest",
  "rand",
  "serde_json",
  "sha2 0.11.0",
@@ -1583,6 +1606,22 @@ dependencies = [
  "streaming-iterator",
  "tree-sitter",
  "tree-sitter-rust",
+ "wreck-protocol",
+]
+
+[[package]]
+name = "wreck-organelles"
+version = "0.1.0"
+dependencies = [
+ "organelle-host",
+ "organelle-manifest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "wreck-adapters",
+ "wreck-canon",
+ "wreck-governor",
+ "wreck-graph",
  "wreck-protocol",
 ]
 

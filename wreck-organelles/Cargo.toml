@@ -1,0 +1,17 @@
+[package]
+name = "wreck-organelles"
+version = "0.1.0"
+edition = "2021"
+description = "wreck as organelles (Tier A): wreck-govern (deterministic merge authority, codon wg) + wreck-ports (substrate execution ports, codon wp)."
+
+[dependencies]
+wreck-protocol = { path = "../wreck-protocol" }
+wreck-graph = { path = "../wreck-graph" }
+wreck-governor = { path = "../wreck-governor" }
+wreck-canon = { path = "../wreck-canon" }
+wreck-adapters = { path = "../wreck-adapters" }
+organelle-host = { path = "../../organelles/crates/organelle-host" }
+organelle-manifest = { path = "../../organelles/crates/organelle-manifest" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
