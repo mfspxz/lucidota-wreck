@@ -1,0 +1,13 @@
+{
+ "wave": 42,
+ "clippy": {
+  "exit": 0,
+  "findings": [
+   "warning: function `tail_hash` is never used\n  --> /home/hatch/workspace/proof-ledger/rs/src/ledger.rs:83:4\n   |\n83 | fn tail_hash(entries: &[Map<String, Value>]) -> String {\n   |    ^^^^^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\n"
+  ]
+ },
+ "audit": {},
+ "semgrep": {
+  "error": "semgrep not installed"
+ }
+}
