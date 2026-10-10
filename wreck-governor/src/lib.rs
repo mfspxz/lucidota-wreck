@@ -1318,6 +1318,11 @@ mod redteam_contract_bypass {
     //! A malicious agent modifies src/auth.rs (governs auth.error-semantics)
     //! but declares ONLY the file, omitting the contract from scope.
     //! The governor's policy check reads view.contracts (agent-declared);
+    //!
+    //! TEST CHARACTER (R-7, 2026-10-10): PROPERTY suite. These tests state the
+    //! security invariant "a contract omission never survives the policy
+    //! check" against the public decide path. Never rewrite an expectation
+    //! here to match a behavior change without adversarial sign-off.
     //! it never measures contracts from the diff. PROVEN below.
 
     use super::*;
