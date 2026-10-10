@@ -35,7 +35,7 @@ No advisory-only detectors found. The governor's checks are gates by constructio
 
 ## 8. R-7
 
-Tests are inline unit tests. The `redteam_contract_bypass` module is property-style (attack scenario against the public decide path; invariant: policy violation yields Reject). Canon/graph inline tests pin demo fixtures (change-detection character). Policy documented: property expectations must never be rewritten to match behavior changes without adversarial sign-off. Explicit per-module labeling deferred to the second sweep.
+Tests are inline unit tests. The `redteam_contract_bypass` module is property-style (attack scenario against the public decide path; invariant: policy violation yields Reject) — labeled PROPERTY in the second sweep. Canon/graph inline tests pin demo fixtures (change-detection character). Policy documented: property expectations must never be rewritten to match behavior changes without adversarial sign-off.
 
 ## 9. R-8
 
