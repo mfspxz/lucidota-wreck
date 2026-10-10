@@ -130,7 +130,10 @@ Simulated a hostile competition judge trying to break the demo and discredit the
 
 **Assessment:** A hostile judge running `cargo test --workspace` would see a failure and question the "all green" claim. This was a pre-existing flake, not caused by red team work.
 
-**Status:** Fixed (passes now). Root cause was likely test parallelism or allocator state.
+**Status:** Fixed (passes now). Root cause: UNVERIFIED (R-12, 2026-10-10) —
+the original note said "likely test parallelism or allocator state" with no
+evidence. The flake was not reproduced under instrumentation, so no root
+cause is claimed.
 
 ### HJ-03: Demo Robustness [PASS]
 
