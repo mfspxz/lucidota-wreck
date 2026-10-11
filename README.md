@@ -1,3 +1,5 @@
+[Active R&D Lab] — latest CI run is failing; active development, expect rough edges.
+
 # wreck — don't merge agents. Merge proven state transitions.
 
 wreck is a **deterministic agent change-governance protocol** built for
