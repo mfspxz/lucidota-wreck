@@ -702,8 +702,8 @@ mod tests {
                 }),
             )
             .expect("propose");
-        assert_eq!(claim["change_id"], "chg-1");
-        assert_eq!(claim["status"], "PROPOSED");
+        assert_eq!(claim.output["change_id"], "chg-1");
+        assert_eq!(claim.output["status"], "PROPOSED");
 
         // boundary validation rejects traversal
         assert!(host
@@ -729,15 +729,15 @@ mod tests {
         let g = host
             .call(&ctx, "wg", "canon_get", serde_json::json!({"id": "R-1"}))
             .expect("canon_get");
-        assert_eq!(g["found"], true);
+        assert_eq!(g.output["found"], true);
 
         // decide runs the real governor; empty view + no evidence -> decided (rejected)
         let view = serde_json::json!({"change_id": "chg-1", "files": [], "symbols": [], "invariants": [], "contracts": [], "dependencies": []});
         let d = host.call(&ctx, "wg", "decide", serde_json::json!({
-            "claim": claim, "view": view, "in_flight": [], "merged": [], "ts": "2026-10-10T00:00:00Z",
+            "claim": claim.output, "view": view, "in_flight": [], "merged": [], "ts": "2026-10-10T00:00:00Z",
         })).expect("decide");
-        assert_eq!(d["outcome"], "decided");
-        assert_eq!(d["record"]["change_id"], "chg-1");
+        assert_eq!(d.output["outcome"], "decided");
+        assert_eq!(d.output["record"]["change_id"], "chg-1");
 
         let n = host.verify_chain().expect("receipt chain must verify");
         assert!(n >= 6, "expected >=6 receipts, got {n}");
@@ -761,7 +761,7 @@ mod tests {
                 }),
             )
             .expect("init");
-        assert_eq!(init["base"].as_str().unwrap().len(), 40);
+        assert_eq!(init.output["base"].as_str().unwrap().len(), 40);
 
         host.call(
             &ctx,
@@ -781,7 +781,7 @@ mod tests {
                 }),
             )
             .expect("commit");
-        assert_eq!(commit["head"].as_str().unwrap().len(), 40);
+        assert_eq!(commit.output["head"].as_str().unwrap().len(), 40);
 
         let view = host
             .call(
@@ -793,13 +793,13 @@ mod tests {
                 }),
             )
             .expect("diff");
-        assert!(view.get("change_id").is_some());
+        assert!(view.output.get("change_id").is_some());
 
         // token custody through the real custodian
         let t1 = host
             .call(&ctx, "wp", "token_for", serde_json::json!({"repo": "r1"}))
             .expect("token_for");
-        assert!(t1["len"].as_u64().unwrap() > 16);
+        assert!(t1.output["len"].as_u64().unwrap() > 16);
         let adj = host
             .call(
                 &ctx,
@@ -808,7 +808,7 @@ mod tests {
                 serde_json::json!({"repo": "r1", "presented": "bogus"}),
             )
             .expect("adjudicate");
-        assert!(adj["adjudication"].is_string());
+        assert!(adj.output["adjudication"].is_string());
 
         let n = host.verify_chain().expect("receipt chain must verify");
         assert!(n >= 6, "expected >=6 receipts, got {n}");
