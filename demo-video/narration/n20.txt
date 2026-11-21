@@ -1,0 +1,1 @@
+Don't merge agents. Merge proven state transitions. wreck is MIT licensed — github dot com slash m f s p x z slash lucidota-wreck.

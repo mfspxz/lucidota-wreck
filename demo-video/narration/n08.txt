@@ -1,0 +1,1 @@
+Verdicts. A, B, and E: accepted and merged, each stamped with a seal hash. C: rejected — conflict with A. Both touch invariant auth-oh-three, overlapping edits in the same auth file. Git sees no textual conflict; wreck sees the semantic one. D: rejected. Rule canon-thirty-one forbids mutating auth error semantics, and every rejection cites its rule.

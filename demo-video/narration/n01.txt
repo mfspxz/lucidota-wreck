@@ -1,0 +1,1 @@
+wreck. Don't merge agents. Merge proven state transitions. A deterministic governor for AI agents pushing code to the same repo.

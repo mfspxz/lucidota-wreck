@@ -1,0 +1,52 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "ai-router/gemini-2.0-flash",
+  "provider": {
+    "ai-router": {
+      "models": {
+        "gemini-2.0-flash": {
+          "name": "Gemini 2.0 Flash (via ai-router failover)"
+        }
+      },
+      "name": "AI Router",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "apiKey": "{env:ROUTER_KEY}",
+        "baseURL": "https://ai-router.cutecity.workers.dev/v1"
+      }
+    },
+    "exaone": {
+      "models": {
+        "k-exaone_v2.5": {
+          "name": "K-EXAONE 2.5"
+        }
+      },
+      "name": "EXAONE",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "apiKey": "{env:EXAONE_API_KEY}",
+        "baseURL": "https://api.exaone.ai/v1"
+      }
+    },
+    "inception": {
+      "models": {
+        "mercury-3": {
+          "name": "Mercury 3"
+        },
+        "mercury-edit-2": {
+          "name": "Mercury Edit 2"
+        },
+        "mercury-2.5": {
+          "name": "Mercury 2.5"
+        }
+      },
+      "name": "Inception",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "apiKey": "{env:INCEPTION_API_KEY}",
+        "baseURL": "https://api.inceptionlabs.ai/v1"
+      }
+    }
+  },
+  "small_model": "ai-router/gemini-2.0-flash"
+}

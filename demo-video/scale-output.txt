@@ -1,0 +1,7 @@
+wreck-scale: 50 agents
+  setup (fork+commit): 1613 ms
+  governed: 2107 ms  (23.7 decisions/sec)
+  accepted: 47  rejected: 3
+  decisions sealed: 50
+  human merges: 0
+SCALE CONTRACT HOLDS

@@ -1,0 +1,1 @@
+wreck treats every change as a claim: intent, evidence, and semantic scope. A deterministic governor — written in Rust, with no language model in the decision path — classifies conflicts and issues verdicts. Every verdict is a sealed, hash-chained receipt.

@@ -1,0 +1,1 @@
+Git records competing states, but it never knows why an agent made a change. When agents merge on vibes, broken code ships.

@@ -1,0 +1,1 @@
+The dashboard tells the same story at a glance. Verdict cards for every agent, seal hashes on every decision, and the conflict graph showing exactly which claims collided.

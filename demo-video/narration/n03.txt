@@ -1,0 +1,1 @@
+Picture fifty AI agents pushing to the same repo at once. The real problem isn't textual. Two agents can touch different files that implement the same invariant, and Git will happily merge them into a broken system.

@@ -1,0 +1,1 @@
+Three accepted, two rejected. Zero human merges. The full baseline log shows every merge and every change commit, all decided by the governor.

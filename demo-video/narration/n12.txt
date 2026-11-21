@@ -1,0 +1,1 @@
+Why was D rejected? Change D touched auth error semantics. Canon-thirty-one: no agent may mutate auth error semantics. Policy violations are rejected with the rule cited — machine-readable, auditable.

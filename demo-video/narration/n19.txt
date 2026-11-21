@@ -1,0 +1,1 @@
+The Cloudflare story. Artifacts provides the substrate — repos, Git, events. wreck provides the governance Artifacts deliberately leaves open. The governor core is substrate-independent: local Git today, Artifacts tomorrow, same MergePort trait. The Worker shell is already built: push events in, verdicts out, WASM decides.

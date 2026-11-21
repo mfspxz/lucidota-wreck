@@ -1,0 +1,12 @@
+Hi — I'm Zachary Cameron, a founder in Vancouver. I'm homeless, my phones and laptops have been stolen more than once, and I'm behind schedule. That's not a pitch for sympathy. It's the truth of how I build.
+
+In February 2026 I started building Lucidota, a second brain that remembers everything and proves every claim with a receipt. I started it because I needed to rebuild thirteen legal cases as evidence I could actually navigate, and I was doing it from a tent trailer on a 4GB laptop. Normal search only finds keywords. Human memory drops things. I wanted something that never loses anything, and can actually think across all of it. The rule I've run on since February 16: never let a task just fail. If a tool goes down, find one that's up and route around. Never stop and do nothing.
+
+Since February I've shipped 23 public repos — Wreck, a deterministic change-governance protocol for AI coding agents; the Lucidota exocortex kernel; a compute exchange; encrypted notes; a voice research agent — plus VanCan, a live bottle-return pickup platform. The system now holds over a million pieces of text, around 358,000 embeddings, and a graph of about 150,000 nodes. All of it is public at github.com/mfspxz.
+
+I want K-EXAONE 2.5 because it's the biggest brain I can reach: 750 billion parameters, half a million tokens of context. That means I can put an entire codebase in one pass and get a real verdict on it — not a skim. Here's what I'd do with $1,000 in credits in fourteen days. Days 1–2: a full teardown of Wreck, published to the repo. Days 3–5: fix the worst hole it finds and prove the fix. Days 6–9: the same teardown pass across ten more repos. Days 10–12: an architecture review of the Lucidota kernel itself. Days 13–14: a public write-up with every run, every result, and every token logged. You'll see exactly where the money went.
+
+I'm not asking for charity. I'm asking for compute. I turn compute into shipped code. Give me $1,000 in credits and watch what I do.
+
+Zachary Cameron
+Vancouver | 236-979-8735 | maroonedpilot@gmail.com | github.com/mfspxz

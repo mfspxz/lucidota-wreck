@@ -1,0 +1,35 @@
+== wreck demo: 5 agents, one auth subsystem ==
+
+baseline: f77d37017493
+agent-a proposed change-a -> 52ac61b9c68b
+agent-b proposed change-b -> 5290cd41a53f
+agent-c proposed change-c -> e4f8388906db
+agent-d proposed change-d -> 2923ff8cfc40
+agent-e proposed change-e -> 278ed3ae2d39
+canon rules active: 2
+
++=========== CHANGE FIELD ===========+
+  agent-a    ACCEPT   seal 24b256ed8783   status Merged
+  agent-b    ACCEPT   seal 178ace14acd0   status Merged
+  agent-c    REJECT   [CONFLICT] conflicts: both affect invariant AUTH-03; overlapping edits in src/auth.rs; overlapping ed...   seal a0a637fedb9c
+  agent-d    REJECT   [rule CANON-31 forbids touching contract auth.error-semantics: no agent may mutate auth error semantics (authority: contract C-17)] policy violation: rule CANON-31 forbids touching contract auth.error-semantics: no agent m...   seal 0d0988276d1c
+  agent-e    ACCEPT   seal cf3346792c61   status Merged
++====================================+
+
+  5 agents  |  5 changes  |  3 accepted  |  2 rejected  |  0 blocked
+  human merge decisions: 0
+  decisions sealed: 5
+
+baseline log:
+93e2249 wreck: merge change-e
+240a8c5 wreck: merge change-b
+278ed3a change-e: cover new validation
+1ba6f7b wreck: merge change-a
+5290cd4 change-b: shorten token expiry
+f77d370 wreck: baseline
+52ac61b change-a: harden token validation
+
+
+dashboard: /tmp/wreck-demo/dashboard.html
+
+DEMO CONTRACT HOLDS: A,B,E merged | C,D rejected | 0 human merges

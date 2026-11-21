@@ -1,0 +1,1 @@
+Why was C rejected? Change C rewrites retry logic on lines thirty to forty-five. Change A hardens token validation on lines ten to forty. Both affect invariant auth-oh-three. Git sees no textual conflict — wreck sees the semantic one.

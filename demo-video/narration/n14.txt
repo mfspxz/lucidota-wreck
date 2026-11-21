@@ -1,0 +1,1 @@
+The full verdict table: agent, change, verdict, and why. Every row is a sealed receipt — you can audit the entire run months later and prove exactly what the governor decided, and why.

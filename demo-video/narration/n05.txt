@@ -1,0 +1,1 @@
+The scenario: five agents, one authentication subsystem. Agent A hardens token validation. B shortens token expiry. C rewrites retry logic. D touches error semantics. E adds tests that depend on A. Watch the governor decide, live, on real Git.

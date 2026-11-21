@@ -1,0 +1,1 @@
+The architecture. Agent forks, pushes, and the governor takes it from there: evidence, canon, conflict graph, verdict. Accept means merge plus a sealed receipt. Reject means the rule and the proof. The core is Rust — wreck protocol, graph, governor, canon, and WASM — with no language model in the decision path.
