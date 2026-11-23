@@ -15,3 +15,18 @@ organelle-manifest = { path = "../../organelles/crates/organelle-manifest" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+
+# wasm32 (org-025 class, WO-09 finding): getrandom 0.2 reaches this crate
+# transitively (ring <- rustls <- ureq <- pl <- wreck-protocol) and refuses
+# wasm*-unknown-unknown at compile time without a JS backend. Enable the
+# "js" feature for wasm32 builds only; native builds are untouched.
+# ring's own SecureRandom impl for SystemRandom is likewise gated on
+# wasm32-unknown-unknown behind its "wasm32_unknown_unknown_js" feature
+# (which itself enables getrandom/js); rustls cannot compile without it.
+# Same class, third layer: rustls-pki-types' UnixTime::now() — called
+# unconditionally by rustls's ticketer — exists on wasm32-unknown-unknown
+# only behind pki-types' "web" feature (web-time backend).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+rustls-pki-types = { version = "1", features = ["web"] }

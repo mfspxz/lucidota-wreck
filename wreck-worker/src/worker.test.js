@@ -10,6 +10,7 @@ import {
   callWasm,
   checkWasmOutputShape,
   claimFromCommit,
+  diffRanges,
   handleMessage,
   handlePush,
   inFlightViews,
@@ -732,4 +733,69 @@ test("cycle-19: buildView provenance reflects tampered bytes", async () => {
   assert.equal(view.blob_provenance.length, 1);
   assert.equal(view.blob_provenance[0].hash, hex("MALICIOUS\n"));
   assert.notEqual(view.blob_provenance[0].hash, hex("legitimate\n"));
+});
+
+// ---------- diffRanges: real line-range measurement (was a TODO stub) ----------
+// Contract mirrors the Rust parse_unified_zero: inclusive 1-based ranges,
+// added in head numbering, removed in base numbering, zero-count hunk
+// sides omitted.
+
+test("diffRanges: identical text measures no ranges", () => {
+  assert.deepEqual(diffRanges("a\nb\nc\n", "a\nb\nc\n"), { added: [], removed: [] });
+  assert.deepEqual(diffRanges("", ""), { added: [], removed: [] });
+});
+
+test("diffRanges: insertion — middle, append, and new file", () => {
+  assert.deepEqual(diffRanges("a\nb\n", "a\nx\nb\n"), { added: [[2, 2]], removed: [] });
+  assert.deepEqual(
+    diffRanges("l1\nl2\nl3\nl4\nl5\n", "l1\nl2\nl3\nl4\nl5\nl6\n"),
+    { added: [[6, 6]], removed: [] },
+  );
+  assert.deepEqual(diffRanges("", "a\nb\nc\n"), { added: [[1, 3]], removed: [] });
+});
+
+test("diffRanges: deletion — middle and whole file", () => {
+  assert.deepEqual(diffRanges("a\nx\nb\n", "a\nb\n"), { added: [], removed: [[2, 2]] });
+  assert.deepEqual(diffRanges("a\nb\nc\n", ""), { added: [], removed: [[1, 3]] });
+});
+
+test("diffRanges: modification — replaced line shows on both sides", () => {
+  assert.deepEqual(
+    diffRanges("line1\nline2\nline3\n", "line1\nLINE2\nline3\n"),
+    { added: [[2, 2]], removed: [[2, 2]] },
+  );
+  // Rust parity case (wreck-adapters diff_view_measures_line_ranges):
+  // line 2 replaced AND line 6 appended in the same diff.
+  assert.deepEqual(
+    diffRanges("line1\nline2\nline3\nline4\nline5\n", "line1\nLINE2\nline3\nline4\nline5\nline6\n"),
+    { added: [[2, 2], [6, 6]], removed: [[2, 2]] },
+  );
+  // A replaced block: two lines out, three lines in, one hunk.
+  assert.deepEqual(
+    diffRanges("a\nb\nc\nd\n", "a\nx\ny\nz\nd\n"),
+    { added: [[2, 4]], removed: [[2, 3]] },
+  );
+});
+
+test("diffRanges: disjoint hunks stay separate and ordered", () => {
+  const oldText = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n";
+  const newText = "l1\nL2\nl3\nl4\nl5\nl6\nl7\nL8\nl9\n";
+  assert.deepEqual(diffRanges(oldText, newText), {
+    added: [[2, 2], [8, 8]],
+    removed: [[2, 2], [8, 8]],
+  });
+});
+
+test("diffRanges: buildView measures real ranges for a changed blob", async () => {
+  const blobs = { old: "line1\nline2\nline3\n", new: "line1\nLINE2\nline3\n" };
+  const repo = {
+    async readTree(hash) { return [{ type: "blob", path: "src/auth.rs", hash }]; },
+    async readBlob(hash) { return new Response(blobs[hash]); },
+  };
+  const env = { ARTIFACTS: { get: () => repo } };
+  const view = await buildView(env, { repoName: "task-1", before: "old", after: "new" });
+  assert.equal(view.files.length, 1);
+  assert.equal(view.files[0].path, "src/auth.rs");
+  assert.deepEqual(view.files[0].removed, [[2, 2]]);
+  assert.deepEqual(view.files[0].added, [[2, 2]]);
 });

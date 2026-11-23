@@ -513,57 +513,21 @@ mod tests {
     }
 }
 
-/// Measured symbol extraction: parse Rust source with tree-sitter and return
-/// the names of `function_item`s whose line span intersects any changed
-/// range. This makes symbols MEASURED instead of agent-declared — the
-/// foundation for structural (not textual) conflict classification.
+/// Measured symbol extraction: parse Rust source and return the
+/// names of functions whose line span intersects any changed
+/// range. This makes symbols MEASURED instead of agent-declared —
+/// the foundation for structural (not textual) conflict
+/// classification.
+///
+/// Implementation: org-038 `ref-code-graph-parse` (pure-Rust `syn`
+/// parser), adopted 2026-11-23 under WO-09. The previous
+/// tree-sitter implementation carried a C build script (cc-rs)
+/// that blocked this crate and five dependents on wasm32; the
+/// public signature and semantics (sorted, deduplicated,
+/// 1-indexed inclusive spans, empty on unparseable source) are
+/// unchanged and pinned by the structural tests below.
 pub fn enclosing_functions(source: &str, ranges: &[(u32, u32)]) -> Vec<String> {
-    use streaming_iterator::StreamingIterator;
-    use tree_sitter::{Parser, Query, QueryCursor};
-    let mut parser = Parser::new();
-    let lang = tree_sitter_rust::LANGUAGE;
-    parser.set_language(&lang.into()).expect("rust grammar");
-    let tree = match parser.parse(source, None) {
-        Some(t) => t,
-        None => return vec![],
-    };
-    let root = tree.root_node();
-    // (function_item) @f with name field
-    let query =
-        Query::new(&lang.into(), "(function_item name: (identifier) @name) @f").expect("query");
-    let mut cursor = QueryCursor::new();
-    let mut out = vec![];
-    let mut it = cursor.matches(&query, root, source.as_bytes());
-    while let Some(m) = {
-        it.advance();
-        it.get()
-    } {
-        let mut name = None;
-        let mut fnode = None;
-        for cap in m.captures {
-            let idx = cap.index as usize;
-            let cap_name = query.capture_names()[idx];
-            if cap_name == "name" {
-                name = Some(
-                    cap.node
-                        .utf8_text(source.as_bytes())
-                        .unwrap_or("")
-                        .to_string(),
-                );
-            } else if cap_name == "f" {
-                fnode = Some(cap.node);
-            }
-        }
-        if let (Some(n), Some(f)) = (name, fnode) {
-            let start = f.start_position().row as u32 + 1; // 1-indexed
-            let end = f.end_position().row as u32 + 1;
-            if ranges.iter().any(|(s, e)| *s <= end && start <= *e) && !out.contains(&n) {
-                out.push(n);
-            }
-        }
-    }
-    out.sort();
-    out
+    ref_code_graph_parse::enclosing_functions(source, ranges)
 }
 
 #[cfg(test)]

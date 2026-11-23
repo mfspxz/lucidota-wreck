@@ -414,11 +414,98 @@ async function readBlobCapped(repo, hash) {
   return text;
 }
 
-/** Minimal -U0 hunk parser (mirrors the Rust parse_unified_zero). */
+/**
+ * Line-range diff between the claim base text and the proposed text.
+ *
+ * Output contract mirrors the Rust parse_unified_zero (wreck-adapters):
+ * inclusive 1-based [start, end] ranges, `added` in head (new) numbering,
+ * `removed` in base (old) numbering, one range per -U0 hunk side, and a
+ * side with zero changed lines in a hunk contributes no range (a pure
+ * insertion has no removed range; a pure deletion has no added range).
+ * A replaced line therefore appears on both sides, exactly as a
+ * `git diff -U0` hunk header reports it.
+ *
+ * Method: trim the common prefix/suffix, then an LCS edit script over
+ * the differing middle, grouped into hunks (maximal change runs
+ * separated by at least one unchanged line). If the middle is too large
+ * for the LCS table, it is reported as a single replaced block — the
+ * ranges still cover every changed line, and over-approximation fails
+ * toward textual-conflict (the governor's safe direction), never toward
+ * a missed overlap.
+ */
+const DIFF_DP_CELL_CAP = 4_000_000; // LCS table cells; see diffRanges.
+
+function splitLines(text) {
+  if (text === "") return [];
+  const parts = text.split("\n");
+  if (parts[parts.length - 1] === "") parts.pop(); // trailing newline ends the last line, it is not an extra line
+  return parts;
+}
+
+/** LCS edit script ("eq" | "del" | "ins") aligning a -> b. */
+function lcsOps(a, b) {
+  const n = a.length, m = b.length, W = m + 1;
+  const dp = new Uint32Array((n + 1) * W);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i * W + j] = a[i] === b[j]
+        ? dp[(i + 1) * W + j + 1] + 1
+        : Math.max(dp[(i + 1) * W + j], dp[i * W + j + 1]);
+    }
+  }
+  const ops = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { ops.push("eq"); i++; j++; }
+    else if (dp[(i + 1) * W + j] >= dp[i * W + j + 1]) { ops.push("del"); i++; }
+    else { ops.push("ins"); j++; }
+  }
+  while (i < n) { ops.push("del"); i++; }
+  while (j < m) { ops.push("ins"); j++; }
+  return ops;
+}
+
 function diffRanges(oldText, newText) {
-  // TODO: implement or ship a tiny LCS; the Rust LocalGit::diff_view is the
-  // reference. For the scaffold, call out to a diff helper.
-  return { added: [], removed: [], _todo: "line ranges" };
+  const oldLines = splitLines(oldText);
+  const newLines = splitLines(newText);
+  const added = [];
+  const removed = [];
+
+  // Common prefix/suffix lines are unchanged by construction.
+  let lo = 0;
+  while (lo < oldLines.length && lo < newLines.length && oldLines[lo] === newLines[lo]) lo++;
+  let oldHi = oldLines.length; // exclusive
+  let newHi = newLines.length; // exclusive
+  while (oldHi > lo && newHi > lo && oldLines[oldHi - 1] === newLines[newHi - 1]) { oldHi--; newHi--; }
+
+  const oldMid = oldLines.slice(lo, oldHi);
+  const newMid = newLines.slice(lo, newHi);
+  if (oldMid.length === 0 && newMid.length === 0) return { added, removed };
+
+  let ops;
+  if (oldMid.length === 0) ops = newMid.map(() => "ins");
+  else if (newMid.length === 0) ops = oldMid.map(() => "del");
+  else if (oldMid.length * newMid.length <= DIFF_DP_CELL_CAP) ops = lcsOps(oldMid, newMid);
+  else ops = [...oldMid.map(() => "del"), ...newMid.map(() => "ins")]; // one replaced block; see header
+
+  // Group the edit script into -U0 hunks. oi/ni are 0-based cursors over
+  // the full line arrays; ranges are emitted 1-based and inclusive.
+  let oi = lo, ni = lo;
+  let hunk = null;
+  const flush = () => {
+    if (!hunk) return;
+    if (hunk.delStart !== null) removed.push([hunk.delStart + 1, hunk.delEnd + 1]);
+    if (hunk.insStart !== null) added.push([hunk.insStart + 1, hunk.insEnd + 1]);
+    hunk = null;
+  };
+  for (const op of ops) {
+    if (op === "eq") { flush(); oi++; ni++; continue; }
+    if (!hunk) hunk = { delStart: null, delEnd: null, insStart: null, insEnd: null };
+    if (op === "del") { if (hunk.delStart === null) hunk.delStart = oi; hunk.delEnd = oi; oi++; }
+    else { if (hunk.insStart === null) hunk.insStart = ni; hunk.insEnd = ni; ni++; }
+  }
+  flush();
+  return { added, removed };
 }
 
 /**
@@ -542,4 +629,4 @@ async function notifyAgent(env, claim, decision) {
 
 // Named exports for unit tests (node --test). The default export above is
 // the Worker entrypoint.
-export { handlePush, handleMessage, claimFromCommit, treeBlobs, readBlobCapped, buildView, waitVisible, inFlightViews, mergedIds, activePolicy, initAuthorityKey };
+export { handlePush, handleMessage, claimFromCommit, treeBlobs, readBlobCapped, buildView, diffRanges, waitVisible, inFlightViews, mergedIds, activePolicy, initAuthorityKey };
